@@ -1,9 +1,10 @@
 {
   "manifest_version": 2,
   "name": "Reading flow",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "A tool for better reading and note-taking",
   "author": "Reading Flow",
+  "homepage_url": "https://github.com/linchenliangdian/readingflow#readme",
   "icons": {
     "16": "content/icons/pyramid.svg",
     "32": "content/icons/pyramid.svg",
