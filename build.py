@@ -15,7 +15,7 @@ def build(repository=None):
     if repository:
         manifest["applications"]["zotero"]["update_url"] = update_url(repository_name(repository))
     assert manifest["applications"]["zotero"]["strict_min_version"] == "9.0"
-    assert manifest["applications"]["zotero"]["strict_max_version"] == "9.0.*"
+    assert manifest["applications"]["zotero"]["strict_max_version"] == "10.0.*"
     feed = manifest["applications"]["zotero"]["update_url"]
     assert feed.startswith("https://github.com/") and feed.endswith("/releases/latest/download/updates.json"), "A public GitHub update feed is required; use --repository OWNER/REPO"
     assert {"32", "48", "96"}.issubset(manifest["icons"])

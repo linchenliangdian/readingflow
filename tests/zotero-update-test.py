@@ -13,7 +13,10 @@ import time
 from zipfile import ZipFile, ZIP_DEFLATED
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_ROOT = ROOT / "tmp" / "zotero-test-update"
+SOURCE_VERSION = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))["version"]
+if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", SOURCE_VERSION) is None:
+    raise ValueError("Unsafe source version for disposable test paths")
+TEST_ROOT = ROOT / "tmp" / ("zotero-test-update-" + SOURCE_VERSION)
 SETTINGS = TEST_ROOT / "test-settings.json"
 
 

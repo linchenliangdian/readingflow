@@ -170,7 +170,7 @@ def publish(metadata, paths):
             raise ValueError(f"Publish the existing Git tag {tag} before releasing")
         release = gh_api(f"{prefix}/releases", method="POST", payload={
             "tag_name": tag, "name": f"Reading flow {version}",
-            "body": f"Reading flow {version}\n\nInstall the versioned XPI in Zotero 9. "
+            "body": f"Reading flow {version}\n\nInstall the versioned XPI in Zotero 9 or 10. "
                     "This release includes the automatic update feed and SHA-256 checksum.",
             "draft": True, "prerelease": False,
         })
