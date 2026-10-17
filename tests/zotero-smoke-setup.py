@@ -117,7 +117,7 @@ def setup(scenario="v2", better_notes=None, port=9223, preview_hold=0, shutdown_
     source = source.replace("__CAPTURE_PREVIEWS__", json.dumps(capture_previews or preview_hold > 0))
     manifest = {
         "manifest_version": 2, "name": "Reading Flow isolated smoke test", "version": "1.0.0",
-        "applications": {"zotero": {"id": TEST_ID, "update_url": "https://reading-flow.invalid/updates.json", "strict_min_version": "9.0", "strict_max_version": "9.0.*"}},
+        "applications": {"zotero": {"id": TEST_ID, "update_url": "https://reading-flow.invalid/updates.json", "strict_min_version": "9.0", "strict_max_version": manifest_source["applications"]["zotero"]["strict_max_version"]}},
     }
     with ZipFile(TEST_ROOT / "harness.xpi", "w", ZIP_DEFLATED) as archive:
         archive.writestr("manifest.json", json.dumps(manifest))

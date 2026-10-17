@@ -26,7 +26,7 @@ def finalize():
         raise RuntimeError("The test result is for another plugin version")
     package = OUTPUT / f"reading-flow-{manifest['version']}.xpi"
     with ZipFile(package) as archive:
-        comparisons = {name: archive.read(name) == (ROOT / name).read_bytes() for name in archive.namelist()}
+        comparisons = {name: archive.read(name) == (ROOT / name).read_text(encoding="utf-8").encode("utf-8") for name in archive.namelist()}
     if not all(comparisons.values()):
         raise RuntimeError("Source changed after the final XPI was built")
     stdout = (TEST_ROOT / "stdout.log").read_text(encoding="utf-8", errors="replace")

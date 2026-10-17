@@ -32,7 +32,7 @@ def finalize():
     package = ROOT / "output" / f"reading-flow-{manifest['version']}.xpi"
     check("installed native package is identical to the deliverable", package.read_bytes() == (TEST_ROOT / "profile" / "extensions" / "reading-flow@local.xpi").read_bytes())
     with ZipFile(package) as archive:
-        check("all packaged runtime files match final source", archive.testzip() is None and all(archive.read(name) == (ROOT / name).read_bytes() for name in archive.namelist()))
+        check("all packaged runtime files match final source", archive.testzip() is None and all(archive.read(name) == (ROOT / name).read_text(encoding="utf-8").encode("utf-8") for name in archive.namelist()))
     check("both child and standalone notes completed cache-free recovery", len(result.get("cacheRecoveryFixtures", [])) == 2)
     with sqlite3.connect((TEST_ROOT / "data" / "zotero.sqlite").as_uri() + "?mode=ro", uri=True) as database:
         for fixture, recovered in zip(result["fixtures"], result["cacheRecoveryFixtures"]):

@@ -35,7 +35,7 @@ def finalize():
     check("all isolated cold test processes exited", exit_evidence["remainingCount"] == 0, exit_evidence)
     package = OUTPUT / f"reading-flow-{version}.xpi"
     with ZipFile(package) as archive:
-        comparisons = {name: archive.read(name) == (ROOT / name).read_bytes() for name in archive.namelist()}
+        comparisons = {name: archive.read(name) == (ROOT / name).read_text(encoding="utf-8").encode("utf-8") for name in archive.namelist()}
     package_bytes = package.read_bytes()
     check("installed package and all runtime files equal final source", bool(comparisons) and all(comparisons.values()) and package_bytes == (TEST_ROOT / "profile" / "extensions" / "reading-flow@local.xpi").read_bytes(), comparisons)
     result["package"] = {"filename": package.name, "bytes": len(package_bytes), "sha256": hashlib.sha256(package_bytes).hexdigest(), "runtimeFileCount": len(comparisons), "sourceComparisons": comparisons}

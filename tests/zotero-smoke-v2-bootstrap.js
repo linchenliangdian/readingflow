@@ -126,7 +126,7 @@ async function runSmokeTest() {
       images.push({ url, width: image.naturalWidth, height: image.naturalHeight });
     }
     check("addon manager and native rail SVG images decode", images.every(image => image.width > 0 && image.height > 0) && images[0].width === images[1].width && images[0].height === images[1].height, images);
-    const [managerSVG, railSVG] = await Promise.all([preferred, railURL].map(url => Zotero.HTTP.request("GET", url, { successCodes: [0, 200], timeout: 10000 })));
+    const [managerSVG, railSVG] = await Promise.all([preferred, railURL].map(async url => ({ responseText: await (await host.fetch(url)).text() })));
     check("resolved icon resources contain identical SVG bytes", managerSVG.responseText === railSVG.responseText && managerSVG.responseText.includes("<svg"));
   }
   async function verifySingleRootMigration(handle, legacy, migratedHTML) {
