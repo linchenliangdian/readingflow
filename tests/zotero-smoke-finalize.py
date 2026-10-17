@@ -106,7 +106,7 @@ def finalize():
     result["package"] = {"filename": package.name, "bytes": package.stat().st_size, "sha256": hashlib.sha256(package.read_bytes()).hexdigest(), "runtimeFileCount": len(comparisons), "sourceComparisons": comparisons}
     result["shutdownBaseline"] = {
         "result": "shutdown-baseline-result.json",
-        "finding": "The same Zotero/Better Notes shutdown errors occur with Reading Flow disabled before quit; they are tracked separately from the owned cleanup and data durability checks.",
+        "finding": "The run with Reading Flow disabled is recorded separately. Compare its logs with this run before attributing host or other-plugin shutdown errors.",
     }
     if not all(check["passed"] for check in result["cleanupChecks"]):
         raise RuntimeError(json.dumps(result["cleanupChecks"], ensure_ascii=False))
