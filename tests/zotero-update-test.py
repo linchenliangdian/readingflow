@@ -162,7 +162,7 @@ def finalize():
     """Check durable bytes only after the guarded native process has exited."""
     settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
     identity = json.loads((TEST_ROOT / "process-identity.json").read_text(encoding="utf-8"))
-    proof = json.loads((TEST_ROOT / "process-exit-check.json").read_text(encoding="utf-8"))
+    proof = json.loads((TEST_ROOT / "process-exit-check.json").read_text(encoding="utf-8-sig"))
     if proof.get("count") != 0 or proof.get("verifiedPID") != identity["processID"]:
         raise ValueError("First confirm no exact isolated profile/data/PID process remains")
     result = json.loads(Path(settings["result"]).read_text(encoding="utf-8"))

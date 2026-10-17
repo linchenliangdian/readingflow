@@ -1,0 +1,112 @@
+name: Publish requested version
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/release-request.json']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reading-flow-stable-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate the version and exact source commit
+        id: request
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          request = json.loads(Path('.github/release-request.json').read_text(encoding='utf-8'))
+          if not isinstance(request, dict) or set(request) != {'version', 'commit'}:
+              raise SystemExit('Release request must contain exactly version and commit')
+          version, commit = request['version'], request['commit']
+          stable = r'(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+          if not isinstance(version, str) or re.fullmatch(stable, version) is None:
+              raise SystemExit('Version must be stable MAJOR.MINOR.PATCH')
+          if not isinstance(commit, str) or re.fullmatch(r'[0-9a-f]{40}', commit) is None:
+              raise SystemExit('Commit must be a full lowercase 40-character Git SHA')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8', newline='\n') as output:
+              output.write(f'version={version}\ntag=v{version}\ncommit={commit}\n')
+          PY
+      - name: Check out the requested immutable source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.request.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify checked-out source and run tests
+        env:
+          RELEASE_COMMIT: ${{ steps.request.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          for file in bootstrap.js content/*.js; do node --check "$file"; done
+          npm test
+          python -m py_compile build.py scripts/release.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build and validate before creating a release tag
+        env:
+          RELEASE_VERSION: ${{ steps.request.outputs.version }}
+          RELEASE_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          python build.py --repository "$GITHUB_REPOSITORY"
+          python scripts/release.py --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --xpi "output/reading-flow-$RELEASE_VERSION.xpi"
+      - name: Create the exact source tag without replacing an existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.request.outputs.commit }}
+          RELEASE_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          python - <<'PY'
+          import os
+          from scripts.release import gh_api, repository_name
+
+          repository = repository_name(os.environ['GITHUB_REPOSITORY'])
+          commit, tag = os.environ['RELEASE_COMMIT'], os.environ['RELEASE_TAG']
+          prefix = f'repos/{repository}/git'
+          ref = gh_api(f'{prefix}/ref/tags/{tag}')
+          if ref is None:
+              ref = gh_api(f'{prefix}/refs', method='POST', payload={
+                  'ref': f'refs/tags/{tag}', 'sha': commit,
+              })
+          target = ref.get('object', {})
+          # Existing annotated tags are accepted only if their final commit matches.
+          for _ in range(10):
+              if target.get('type') != 'tag':
+                  break
+              annotated = gh_api(f"{prefix}/tags/{target['sha']}")
+              if annotated is None:
+                  raise SystemExit('Could not resolve the existing annotated tag')
+              target = annotated.get('object', {})
+          if target.get('type') != 'commit' or target.get('sha') != commit:
+              raise SystemExit('Existing tag points to different source; it will not be changed')
+          print(f'Verified {tag} points to {commit}')
+          PY
+      - name: Upload a complete draft, verify, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.request.outputs.version }}
+          RELEASE_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          python scripts/release.py --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --xpi "output/reading-flow-$RELEASE_VERSION.xpi" --publish

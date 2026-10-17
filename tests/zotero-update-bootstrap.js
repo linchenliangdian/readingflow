@@ -24,6 +24,14 @@ async function runUpdateTest() {
     }
     throw new Error("Timeout waiting for " + label);
   }
+  async function bounded(promise, label, timeout = 45000) {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Timeout waiting for " + label)), timeout);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
   async function completeLifecycle(addon, enable) {
     const owner = Zotero.Plugins._addonObserver;
     const method = enable ? "onEnabling" : "onDisabled";
@@ -38,7 +46,7 @@ async function runUpdateTest() {
     };
     owner[method] = wrapper;
     try {
-      await (enable ? addon.enable() : addon.disable());
+      await bounded(Promise.resolve().then(() => enable ? addon.enable() : addon.disable()), "native addon toggle");
       await waitFor(() => completed, "native plugin lifecycle");
       if (failure) throw failure;
     } finally { if (owner[method] === wrapper) owner[method] = original; }
@@ -46,7 +54,7 @@ async function runUpdateTest() {
   async function installFile(path) {
     const installation = await AddonManager.getInstallForFile(Zotero.File.pathToFile(path));
     if (installation.error) throw new Error("Baseline installer error: " + installation.error);
-    await installation.install();
+    await bounded(installation.install(), "local baseline installation");
     return await waitFor(async () => {
       const addon = await AddonManager.getAddonByID(settings.addonId);
       return addon?.isActive && addon;
@@ -98,8 +106,15 @@ async function runUpdateTest() {
         onInstallEnded(current, updated) { clearTimeout(timeout); resolve(updated); },
       });
     });
-    await install.install();
-    addon = await installed;
+    try {
+      addon = await Promise.race([
+        installed,
+        Promise.resolve().then(() => install.install()).then(() => installed)
+      ]);
+    } catch (error) {
+      try { install.cancel(); } catch (ignored) {}
+      throw error;
+    }
     await waitFor(() => Zotero.ReadingFlow?.openItem && Zotero.Prefs.get("readingFlow.githubUpdatesMigrationVersion") >= 1,
       "downloaded Reading flow startup and migration");
     check("downloaded addon is active at the published version", addon.version === settings.version && addon.isActive, addon.version);
@@ -127,9 +142,12 @@ async function runUpdateTest() {
     Zotero.logError(error);
   } finally {
     result.finishedAt = new Date().toISOString();
-    await writes;
-    await IOUtils.writeUTF8(settings.result, JSON.stringify(result, null, 2), { tmpPath: settings.result + ".tmp" });
-    delete Zotero.__readingFlowUpdateSandbox;
-    if (safeToQuit) Services.startup.quit(Components.interfaces.nsIAppStartup.eAttemptQuit);
+    try {
+      await writes;
+      await IOUtils.writeUTF8(settings.result, JSON.stringify(result, null, 2), { tmpPath: settings.result + ".tmp" });
+    } finally {
+      delete Zotero.__readingFlowUpdateSandbox;
+      if (safeToQuit) Services.startup.quit(Components.interfaces.nsIAppStartup.eAttemptQuit);
+    }
   }
 }

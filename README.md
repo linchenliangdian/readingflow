@@ -98,3 +98,5 @@ python scripts/release.py --repository linchenliangdian/readingflow --tag v2.1.1
 ```
 
 同一版本的已发布安装包不应覆盖；修复后提升版本并创建新标签。仓库需公开，以便 Zotero 无需 GitHub 登录即可读取更新清单和安装包。
+
+也可直接在 GitHub 提交发布请求，无需本机安装 GitHub CLI：先将新版本源码提交到仓库并取得完整 commit SHA，再修改 `.github/release-request.json` 中的 `version` 与 `commit`，提交到 `main`。例如 `{"version":"2.1.1","commit":"9236ebf751474ecc687d1ffed22f9413e1e9459b"}`。工作流会检出这一确切提交，测试与构建通过后创建指向它的版本标签并完整发布；已有同名标签指向其他提交时会停止，既有发布文件不会覆盖。失败后可在 Actions 的 **Publish requested version** 中重新运行；请求中的版本必须与所指提交的 `manifest.json`、`package.json` 一致。
