@@ -1,0 +1,12 @@
+tmp/
+output/
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+VALIDATION*.md
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

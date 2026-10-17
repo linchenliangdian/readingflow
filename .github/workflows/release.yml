@@ -1,0 +1,59 @@
+name: Release plugin
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing stable version tag, for example v2.1.1'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Serialize stable releases so an earlier upload cannot replace a newer feed.
+concurrency:
+  group: reading-flow-stable-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check JavaScript and run unit tests
+        run: |
+          for file in bootstrap.js content/*.js; do node --check "$file"; done
+          npm test
+      - name: Test release tooling
+        run: |
+          python -m py_compile build.py scripts/release.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build and validate the stable release
+        run: |
+          python build.py --repository "$GITHUB_REPOSITORY"
+          version="$(node -p 'require("./manifest.json").version')"
+          python scripts/release.py --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --xpi "output/reading-flow-$version.xpi"
+      - name: Upload a complete draft, verify, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p 'require("./manifest.json").version')"
+          python scripts/release.py --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --xpi "output/reading-flow-$version.xpi" --publish

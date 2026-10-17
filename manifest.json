@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "Reading flow",
+  "version": "2.1.1",
+  "description": "A tool for better reading and note-taking",
+  "author": "Reading Flow",
+  "icons": {
+    "16": "content/icons/pyramid.svg",
+    "32": "content/icons/pyramid.svg",
+    "48": "content/icons/pyramid.svg",
+    "64": "content/icons/pyramid.svg",
+    "96": "content/icons/pyramid.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "reading-flow@local",
+      "update_url": "https://github.com/linchenliangdian/readingflow/releases/latest/download/updates.json",
+      "strict_min_version": "9.0",
+      "strict_max_version": "9.0.*"
+    }
+  }
+}

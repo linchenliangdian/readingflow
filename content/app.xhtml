@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>阅读工具</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="core.js" defer="defer"></script>
+  <script src="app.js" defer="defer"></script>
+</head>
+<body>
+  <div id="tools">
+    <div class="toolbar" aria-label="阅读计时和工具">
+      <button id="start-inspection" class="start" type="button" title="开始 10 分钟检视阅读">10 分钟 <span>开始</span></button>
+      <button id="start-analysis" class="start" type="button" title="开始 20 分钟分析阅读">20 分钟 <span>开始</span></button>
+      <span id="timer-time" class="time" role="timer" aria-live="off">10:00</span>
+      <button id="timer-pause" type="button" disabled="disabled">暂停</button>
+      <button id="timer-reset" type="button" title="重置当前倒计时">重置</button>
+      <span class="spacer"></span>
+      <button id="checklist-toggle" type="button" aria-expanded="false" aria-controls="checklist-area" title="展开检视阅读清单">检视 ▾</button>
+      <button id="pyramid-toggle" type="button" aria-label="金字塔" aria-expanded="false" aria-controls="pyramid-area" title="展开金字塔"><img src="icons/pyramid.svg" width="20" height="20" alt="" aria-hidden="true" /></button>
+      <button id="more-toggle" type="button" aria-expanded="false" aria-controls="more-area" title="备份操作">…</button>
+    </div>
+    <div class="status-line"><span id="status" role="status">等待文献…</span><span id="mode-label"></span></div>
+    <div id="sync-area" class="sync-area" hidden="hidden"><label for="sync-version">保留的版本</label><select id="sync-version" aria-label="金字塔同步版本"></select><button id="sync-use" type="button">采用此版本</button></div>
+    <div id="more-area" class="more-area" hidden="hidden"><button id="backup-export" type="button">导出工具记录</button><button id="backup-import" type="button">导入工具记录</button><span>JSON 备份</span></div>
+    <section id="checklist-area" class="checklist-area" aria-label="检视阅读清单" hidden="hidden"><div id="inspection-checks" class="checks"></div><label class="complete-check"><input id="inspection-completed" type="checkbox" />检视完成</label></section>
+    <section id="pyramid-area" class="pyramid-area" aria-label="金字塔" hidden="hidden">
+      <div class="pyramid-toolbar"><span id="selected-label">顶层</span><button id="node-child" type="button">＋ 下层</button><button id="node-sibling" type="button">＋ 同级</button><button id="node-delete" type="button">删除</button><button id="node-up" type="button" title="向前移动同级节点">↑</button><button id="node-down" type="button" title="向后移动同级节点">↓</button><button id="node-bold" type="button" aria-label="加粗" aria-pressed="false" aria-keyshortcuts="Control+b Meta+b" title="加粗（Ctrl+B）" disabled="disabled">B</button><button id="framing-toggle" type="button" aria-expanded="false" aria-controls="framing-note" title="展开主题旁的背景与冲突">背景／冲突</button><span class="spacer"></span><button id="insert-pyramid" type="button">插入笔记</button></div>
+      <div id="diagram-scroll" class="diagram-scroll"><div id="diagram" class="diagram"></div></div>
+      <div id="pyramid-resizer" role="separator" tabindex="0" aria-label="调整金字塔显示高度" aria-orientation="horizontal" aria-valuemin="64" aria-valuemax="1600" title="上下拖动调整高度；双击恢复自动高度"></div>
+    </section>
+  </div>
+</body>
+</html>

@@ -1,0 +1,38 @@
+name: Check plugin
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check JavaScript and run unit tests
+        run: |
+          for file in bootstrap.js content/*.js; do node --check "$file"; done
+          npm test
+      - name: Test release tooling
+        run: |
+          python -m py_compile build.py scripts/release.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build and validate the automatic update feed
+        run: |
+          python build.py --repository "$GITHUB_REPOSITORY"
+          version="$(node -p 'require("./manifest.json").version')"
+          python scripts/release.py --repository "$GITHUB_REPOSITORY" --tag "v$version" --xpi "output/reading-flow-$version.xpi"
