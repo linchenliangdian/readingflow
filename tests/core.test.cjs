@@ -263,7 +263,7 @@ test('rich HTML escapes every text run and preserves paragraph breaks across spa
   s.pyramid.text = '原有<标签>\n主题'; s.pyramid.boldRanges = [{ start: 2, end: 6 }];
   const child = core.addNode(s, 'root'); child.text = '支持😀结论'; child.boldRanges = [{ start: 2, end: 4 }];
   for (const html of [core.renderStarterNoteHTML(s, now), core.renderNoteHTML(s, now)]) {
-    assert.ok(html.includes('<strong>主题／核心观点：</strong>原有<strong>&lt;标签&gt;</strong><br />主题'));
+    assert.ok(html.includes('<strong>疑问／回答：</strong>原有<strong>&lt;标签&gt;</strong><br />主题'));
     assert.ok(html.includes('支持<strong>😀</strong>结论'));
     assert.ok(!html.includes('<标签>'));
   }

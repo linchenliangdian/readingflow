@@ -297,8 +297,8 @@
     const input = el("div", "node-text");
     input.setAttribute("contenteditable", String(!readOnly)); input.setAttribute("role", "textbox");
     input.setAttribute("aria-multiline", "true"); input.setAttribute("aria-disabled", String(readOnly));
-    input.setAttribute("aria-label", root ? "主题／核心观点" : "节点内容");
-    input.setAttribute("data-placeholder", root ? "主题或核心观点，可分行写下问题与回答。" : "论点或理由，写成一句完整的话。");
+    input.setAttribute("aria-label", root ? "疑问／回答" : "节点内容");
+    input.setAttribute("data-placeholder", root ? "疑问与回答，可分行填写。" : "论点或理由，写成一句完整的话。");
     paintEditor(input, node);
     input.addEventListener("input", event => syncEditor(input, node, event.isComposing));
     input.addEventListener("compositionend", () => syncEditor(input, node, false));
@@ -325,11 +325,11 @@
   }
   function nodeCard(node, root) {
     const card = el("div", "node" + (node.id === selectedID ? " selected" : "")); card.setAttribute("data-node-id", node.id); card.tabIndex = 0;
-    card.setAttribute("aria-label", root ? "主题／核心观点" : "金字塔节点");
+    card.setAttribute("aria-label", root ? "疑问／回答" : "金字塔节点");
     card.addEventListener("click", () => selectNode(node.id));
     card.addEventListener("focusin", () => selectNode(node.id));
     const heading = el("div", "node-heading");
-    if (root) heading.textContent = "主题／核心观点";
+    if (root) heading.textContent = "疑问／回答";
     else {
       const kind = el("select"); kind.disabled = readOnly; kind.setAttribute("aria-label", "节点类别");
       [["argument", "论点"], ["evidence", "理由"], ["thesis", "主题"]].forEach(([value, name]) => { const option = el("option", "", name); option.value = value; kind.appendChild(option); });

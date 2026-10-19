@@ -326,7 +326,7 @@
     const labels = { thesis: "结论", argument: "论点", evidence: "支撑／证据" };
     const orders = { structure: "结构顺序", time: "时间顺序", importance: "重要性顺序" };
     function nodeHTML(n) {
-      let html = "<li><p><strong>" + (n.id === "root" ? "主题／核心观点" : labels[n.type]) + "：</strong>" + (n.text ? renderRichTextHTML(n.text, n.boldRanges) : "（待填写）") + "</p>";
+      let html = "<li><p><strong>" + (n.id === "root" ? "疑问／回答" : labels[n.type]) + "：</strong>" + (n.text ? renderRichTextHTML(n.text, n.boldRanges) : "（待填写）") + "</p>";
       if (n.source) html += paragraph("出处", n.source);
       if (n.children.length) {
         if (n.question) html += paragraph("下层回答的问题", n.question);
@@ -361,7 +361,7 @@
     const line = (label, v, ranges) => "<p><strong>" + label + "：</strong>" + renderRichTextHTML(v, ranges) + "</p>";
     let html = '<div data-schema-version="9"><h1>' + value(s.item.title) + '</h1>';
     html += '<h2>主题与结构</h2>';
-    html += line('主题／核心观点', s.pyramid.text, s.pyramid.boldRanges);
+    html += line('疑问／回答', s.pyramid.text, s.pyramid.boldRanges);
     if (s.inspection.question) html += line('检视时的研究问题', s.inspection.question);
     html += line('主要部分及其联系', s.inspection.structure);
     if (s.framing.situation) html += line('背景', s.framing.situation);
@@ -467,7 +467,7 @@
     const baselineOffset = 9 + fontSize;
     const nodes = [], levels = [];
     function measure(n, depth, parentID) {
-      const { lines, lineRuns, lineUnits } = wrapDiagramText(n.text || (depth === 0 ? '主题／核心观点' : '论点／理由'), n.boldRanges, maxUnits);
+      const { lines, lineRuns, lineUnits } = wrapDiagramText(n.text || (depth === 0 ? '疑问／回答' : '论点／理由'), n.boldRanges, maxUnits);
       function append(value) {
         const wrapped = wrapDiagramText(value, null, maxUnits);
         lines.push(...wrapped.lines); lineRuns.push(...wrapped.lineRuns); lineUnits.push(...wrapped.lineUnits);

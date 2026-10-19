@@ -134,7 +134,7 @@ async function runSmokeTest() {
     const root = document.querySelector('.node[data-node-id="root"]');
     const editors = root.querySelectorAll(".node-text");
     const state = handle.getState();
-    check("root contains one native sidebar text box", editors.length === 1 && editors[0].getAttribute("aria-label") === "主题／核心观点" && editors[0].getAttribute("contenteditable") === "true");
+    check("root contains one native sidebar text box", editors.length === 1 && editors[0].getAttribute("aria-label") === "疑问／回答" && editors[0].getAttribute("contenteditable") === "true");
     check("single root preserves legacy question and answer once", state.framing.question === "" && occurrences(state.pyramid.text, legacy.framing.question) === 1 && occurrences(state.pyramid.text, legacy.pyramid.text) === 1 && editors[0].textContent === state.pyramid.text, state.pyramid.text);
     check("migration retains inspection question independently", state.inspection.question === legacy.inspection.question);
     check("native starter includes merged root content once", occurrences(migratedHTML, legacy.framing.question) === 1 && occurrences(migratedHTML, legacy.pyramid.text) === 1);

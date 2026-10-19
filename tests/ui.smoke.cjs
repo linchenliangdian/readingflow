@@ -296,7 +296,7 @@ async function resizingIframeRegression(browser) {
     pass('real 730px iframe allocation stays stable with all menus open in a 468px panel');
 
     const beforeManual = await page.evaluate(() => window.requested);
-    await frame.getByRole('textbox', { name: '主题／核心观点', exact: true }).evaluate(node => { node.style.height = '150px'; });
+    await frame.getByRole('textbox', { name: '疑问／回答', exact: true }).evaluate(node => { node.style.height = '150px'; });
     await page.waitForFunction(before => window.requested > before, beforeManual);
     assert.equal(await page.evaluate(() => window.allocated), 304);
     await page.evaluate(() => { document.getElementById('panel').style.width = '430px'; });
@@ -400,7 +400,7 @@ async function manualHeightRegression(browser) {
     await waitManual(shrunk.manualHeight + 20);
     await page.keyboard.press('Shift+ArrowUp'); await waitManual(Math.max(64, shrunk.manualHeight - 60));
     const keyboardHeight = (await sizing()).manualHeight;
-    await frame.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill('保持独立的窗口高度');
+    await frame.getByRole('textbox', { name: '疑问／回答', exact: true }).fill('保持独立的窗口高度');
     await frame.locator('#node-child').click();
     await frame.getByRole('textbox', { name: '节点内容', exact: true }).fill('新增节点时，滚动区域高度保持用户设置。');
     assert.equal((await sizing()).manualHeight, keyboardHeight);
@@ -411,7 +411,7 @@ async function manualHeightRegression(browser) {
     await frame.locator('#pyramid-toggle').click(); await waitManual(keyboardHeight);
     assert.equal(await frame.evaluate(() => window.ReadingFlowApp.getState().pyramid.children[0].text), '新增节点时，滚动区域高度保持用户设置。');
     await page.evaluate(() => window.configure(true, 'HEIGHTREADONLY'));
-    assert.equal(await frame.getByRole('textbox', { name: '主题／核心观点', exact: true }).getAttribute('contenteditable'), 'false');
+    assert.equal(await frame.getByRole('textbox', { name: '疑问／回答', exact: true }).getAttribute('contenteditable'), 'false');
     await frame.locator('#pyramid-resizer').focus(); await page.keyboard.press('ArrowDown'); await waitManual(keyboardHeight + 20);
     assert.equal(await page.evaluate(() => window.heightPreference), keyboardHeight + 20);
     pass('keyboard adjustment and display preference survive reloads and remain usable for read-only notes');
@@ -534,19 +534,19 @@ async function manualHeightRegression(browser) {
     const mergedRoot = '怎样把文章的论证结构组织得清楚？\n\n用一个核心回答统领论点，并用具体理由支撑论点。';
     await page.locator('#pyramid-toggle').click();
     assert.equal(await page.locator('[data-node-id="root"] .node-text').count(), 1);
-    assert.equal(await page.locator('[data-node-id="root"] .node-heading').textContent(), '主题／核心观点');
+    assert.equal(await page.locator('[data-node-id="root"] .node-heading').textContent(), '疑问／回答');
     assert.equal(await page.getByRole('textbox', { name: '科学问题', exact: true }).count(), 0);
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).textContent(), mergedRoot);
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), mergedRoot);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().framing.question), '');
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().inspection.question), '独立保留的检视问题');
-    await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill(mergedRoot);
+    await page.getByRole('textbox', { name: '疑问／回答', exact: true }).fill(mergedRoot);
     pass('legacy root fields merge into one multiline textbox without losing the independent inspection question');
     const situation = '现有研究把论证分散在多个段落。', complication = '核心观点与证据之间的关系仍不清楚。';
     await page.locator('#framing-toggle').click();
     await page.locator('#framing-situation').fill(situation);
     await page.locator('#framing-complication').fill(complication);
     assert.equal(await page.locator('.root-wrap > .node > .node-text').count(), 1);
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).textContent(), mergedRoot);
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), mergedRoot);
     const framingGeometry = await page.evaluate(() => {
       const root = document.querySelector('.root-wrap > .node').getBoundingClientRect(), annotation = document.querySelector('.framing-note').getBoundingClientRect();
       return { rootWidth: root.width, annotationWidth: annotation.width, separated: annotation.right <= root.left || root.right <= annotation.left || annotation.bottom <= root.top || root.bottom <= annotation.top };
@@ -619,7 +619,7 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramid.children[0].children[0].text), '读者可以从核心结论继续追问“为什么”。');
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().inspection.completed), true);
     await page.locator('#pyramid-toggle').click();
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).textContent(), mergedRoot);
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), mergedRoot);
     assert.equal(await page.locator('[data-node-id="root"] .node-text').count(), 1);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().framing.question), '');
     assert.equal(await page.locator('#framing-situation').evaluate(input => input.value), situation);
@@ -629,7 +629,7 @@ async function manualHeightRegression(browser) {
     pass('autosaved tools reload with the complete pyramid and six-step inspection state');
 
     await page.evaluate(() => { window.__failSave = true; });
-    await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill('保存失败时仍可以导出备份');
+    await page.getByRole('textbox', { name: '疑问／回答', exact: true }).fill('保存失败时仍可以导出备份');
     await page.waitForFunction(() => document.getElementById('status').textContent.includes('保存失败'));
     await page.locator('#more-toggle').click(); await page.locator('#backup-export').click();
     await page.waitForFunction(() => window.__backup && window.__backup.pyramid.text === '保存失败时仍可以导出备份');
@@ -651,8 +651,8 @@ async function manualHeightRegression(browser) {
       window.dispatchEvent(new CustomEvent('reading-flow-config', { detail: config }));
     });
     await page.waitForFunction(() => document.getElementById('mode-label').textContent === '只读');
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).getAttribute('contenteditable'), 'false');
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).getAttribute('aria-disabled'), 'true');
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).getAttribute('contenteditable'), 'false');
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).getAttribute('aria-disabled'), 'true');
     assert.equal(await page.locator('#node-bold').isDisabled(), true);
     assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
     const readOnlySize = await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize);
@@ -674,7 +674,7 @@ async function manualHeightRegression(browser) {
       await window.ReadingFlowApp.loadConfig(window.mockConfig(item, null));
       window.__switchBaseline = window.__saves.length;
     });
-    await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill('未授权旧帧不得覆盖新工具记录');
+    await page.getByRole('textbox', { name: '疑问／回答', exact: true }).fill('未授权旧帧不得覆盖新工具记录');
     await page.evaluate(async () => {
       const item = { libraryID: 1, key: 'PAPER003', title: 'Third paper' };
       await window.ReadingFlowApp.loadConfig(window.mockConfig(item, null));
@@ -682,10 +682,10 @@ async function manualHeightRegression(browser) {
     await page.waitForTimeout(350);
     assert.equal(await page.evaluate(() => window.__saves.length), await page.evaluate(() => window.__switchBaseline));
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().item.key), 'PAPER003');
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).textContent(), '');
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), '');
     pass('configuration replacement discards stale-frame debounce without writing the previous draft');
     await page.evaluate(() => { window.__holdSave = true; window.__insertBaseline = window.__inserted.length; });
-    await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill('插入开始时的文献 A');
+    await page.getByRole('textbox', { name: '疑问／回答', exact: true }).fill('插入开始时的文献 A');
     await page.locator('#insert-pyramid').click();
     await page.waitForFunction(() => window.__saveBlocked);
     assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
@@ -711,7 +711,7 @@ async function manualHeightRegression(browser) {
     });
     await page.waitForFunction(() => !document.getElementById('insert-pyramid').disabled);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().item.key), 'PAPER005');
-    assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).textContent(), '');
+    assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), '');
     pass('an in-flight import cannot replace the new paper after configuration changes');
     await page.evaluate(async () => {
       const item = { libraryID: 1, key: 'SYNC0001', title: '同步版本选择' }, first = window.ReadingFlowCore.createSession(item), second = window.ReadingFlowCore.createSession(item);
