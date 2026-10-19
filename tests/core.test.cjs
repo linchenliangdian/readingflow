@@ -344,3 +344,62 @@ test('background and complication render beside the root without changing the tr
     assert.equal(annotated.nodes[i].x - annotated.nodes[0].x, plain.nodes[i].x - plain.nodes[0].x);
   }
 });
+
+test('old backups retain the original pyramid size and only supported numeric sizes survive normalization', () => {
+  const original = core.createSession(item, now);
+  assert.equal(original.pyramidFontSize, 14);
+  delete original.pyramidFontSize;
+  original.pyramid.text = '旧笔记不会因增加字号而改变内容';
+  assert.equal(core.normalizeSession(original, item, now).pyramidFontSize, 14);
+  assert.equal(Object.hasOwn(original, 'pyramidFontSize'), false, 'migrating a backup does not mutate it');
+  for (const value of [10, 12, 14, 16, 18, 20, 24, 28, 32]) {
+    const restored = core.normalizeSession({ ...original, pyramidFontSize: value }, item, now);
+    assert.equal(restored.pyramidFontSize, value);
+    assert.equal(core.normalizeSession(JSON.parse(JSON.stringify(restored)), item, now).pyramidFontSize, value);
+  }
+  for (const value of [undefined, null, false, true, '24', '32px', [], {}, 0, -14, 13, 14.5, 33, 1000000, NaN, Infinity]) {
+    assert.equal(core.normalizeSession({ ...original, pyramidFontSize: value }, item, now).pyramidFontSize, 14, String(value));
+  }
+});
+
+test('large pyramid text reflows inside fixed-width boxes without losing bold Unicode or colliding with the next level', () => {
+  const s = core.createSession(item, now);
+  s.pyramid.text = 'WW😀中 <unsafe> ' + 'long bold English 中文理由😀 '.repeat(8);
+  s.pyramid.boldRanges = [{ start: 2, end: 22 }];
+  s.pyramid.source = 'p.123 — ' + '原文出处'.repeat(8);
+  s.framing.situation = '背景 ' + '长期研究观察到了森林变化。'.repeat(8);
+  s.framing.complication = '冲突 <not-html> ' + '原因仍不明确😀'.repeat(8);
+  const first = core.addNode(s, 'root'); first.text = '第一组 ' + 'WW中文😀reason '.repeat(20);
+  core.addNode(s, first.id).text = '下层证据 '.repeat(24);
+  core.addNode(s, 'root').text = '另一组 '.repeat(18);
+  const regular = core.layoutPyramid(s, now);
+  s.pyramidFontSize = 32;
+  const large = core.layoutPyramid(s, now);
+  assert.equal(large.width, regular.width, 'larger type must not widen the diagram and cancel its benefit when fitted into a note');
+  assert.ok(large.height > regular.height);
+  assert.equal(large.fontSize, 32);
+  const boxes = [...large.nodes, large.annotation];
+  for (const box of boxes) {
+    assert.equal(box.width, 240);
+    assert.ok(box.x >= 0 && box.x + box.width <= large.width);
+    assert.ok(box.y >= 0 && box.y + box.height <= large.height);
+    box.lineUnits.forEach(units => assert.ok(units * 32 <= box.width - 28 + 1e-9, 'wrapped line remains inside its box'));
+    assert.ok(large.baselineOffset + (box.lines.length - 1) * large.lineHeight + 32 * 0.3 < box.height);
+    for (const other of boxes.filter(value => value !== box)) {
+      assert.ok(box.x + box.width <= other.x || other.x + other.width <= box.x || box.y + box.height <= other.y || other.y + other.height <= box.y, 'boxes do not overlap');
+    }
+    for (const line of box.lines) for (const ch of line) assert.ok(ch.length === 2 || ch.charCodeAt(0) < 0xd800 || ch.charCodeAt(0) > 0xdfff);
+  }
+  for (const node of large.nodes.filter(value => value.parentID)) {
+    const parent = large.nodes.find(value => value.id === node.parentID);
+    assert.ok(node.y >= parent.y + parent.height + 48);
+  }
+  const root = large.nodes[0], sourceOffset = root.lines.join('').indexOf('出处：');
+  assert.equal(root.lines.join('').slice(0, sourceOffset), s.pyramid.text);
+  assert.equal(root.lineRuns.flat().filter(run => run.bold).map(run => run.text).join(''), s.pyramid.text.slice(2, 22));
+  const svg = core.renderPyramidSVG(s, now);
+  assert.equal((svg.match(/font-size="32"/g) || []).length, boxes.length);
+  assert.match(svg, /font-weight="700"/);
+  assert.ok(svg.includes('&lt;') && svg.includes('&gt;'), 'untrusted text remains escaped even after wrapping');
+  assert.doesNotMatch(svg, /<unsafe>|<not-html>/);
+});

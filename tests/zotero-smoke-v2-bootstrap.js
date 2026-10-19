@@ -202,6 +202,23 @@ async function runSmokeTest() {
     if (capturePreviews) result.framingPreviewPath = await captureNativeWindow(handle.hostWindow, "native-framing-preview.png");
     if (wasHidden) setDisclosure(handle, "pyramid-area", "pyramid-toggle", false);
   }
+  async function verifyPyramidFontSize(handle) {
+    const window = handle.toolsWindow, document = window.document, before = handle.getState();
+    const control = document.getElementById("pyramid-font-size");
+    check("native pyramid exposes whole-diagram font size next to bold", !!control && !control.disabled && control.value === "14" && !!(document.getElementById("node-bold").compareDocumentPosition(control) & window.Node.DOCUMENT_POSITION_FOLLOWING));
+    control.value = "24"; control.dispatchEvent(new window.Event("change", { bubbles: true }));
+    await window.ReadingFlowApp.flushPendingSave();
+    const after = handle.getState();
+    check("native font size updates the saved session", after.pyramidFontSize === 24 && control.value === "24");
+    check("native font size preserves text, bold and framing", JSON.stringify(after.pyramid) === JSON.stringify(before.pyramid) && JSON.stringify(after.framing) === JSON.stringify(before.framing));
+    check("native node and annotation text use the selected font size", Array.from(document.querySelectorAll(".node-text,.framing-field textarea")).every(editor => window.getComputedStyle(editor).fontSize === "24px"));
+    const svg = new window.DOMParser().parseFromString(window.ReadingFlowCore.renderPyramidSVG(after), "image/svg+xml");
+    check("native image source uses selected font size including annotation", Array.from(svg.querySelectorAll("text")).every(node => node.getAttribute("font-size") === "24") && !!svg.querySelector('[data-role="framing-annotation"] text'));
+    const cachePath = PathUtils.join(expectedData, "reading-flow", after.item.libraryID + "-" + after.item.key + ".json");
+    const cached = JSON.parse(await IOUtils.readUTF8(cachePath));
+    check("native local draft retains font size after save", cached.pyramidFontSize === 24);
+    result.pyramidFontSize = { value: 24, libraryID: after.item.libraryID, ownerKey: after.item.key };
+  }
   async function typeNative(handle, text) {
     const instance = handle.editor.getCurrentInstance();
     const nativeWindow = instance._iframeWindow;
@@ -704,6 +721,7 @@ async function runSmokeTest() {
     check("migration escapes input", migrated.includes("&lt;script&gt;") && !migrated.includes("<script>"));
     await verifySingleRootMigration(current, legacy, migrated);
     await verifyFramingAnnotations(current, legacy);
+    await verifyPyramidFontSize(current);
     const nativeText = "实机原生编辑：此段必须在切换及插图后保留。";
     await typeNative(current, nativeText);
     check("native note content persisted", (await savedNoteHTML(current.note)).includes(nativeText));

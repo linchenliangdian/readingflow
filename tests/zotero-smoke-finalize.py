@@ -102,6 +102,10 @@ def finalize():
     preference_pattern = r'user_pref\("' + re.escape(height_preference.get("key", "")) + r'",\s*' + str(expected_height) + r'\);'
     height_check = {"name": "chosen pyramid viewport height survives application exit", "passed": isinstance(expected_height, int) and 64 <= expected_height <= 1600 and height_preference.get("key") == "extensions.zotero.readingFlow.pyramidHeight" and bool(re.search(preference_pattern, preferences)), "evidence": "Read-only isolated profile prefs.js after verified process exit"}
     result["cleanupChecks"] = [cleanup_check, persisted_check, root_check, formatting_check, standalone_prose_check, standalone_draft_check, standalone_image_check, reader_note_check, reader_draft_check, height_check]
+    font_fixture = result.get("pyramidFontSize")
+    if font_fixture:
+        font_draft = json.loads((TEST_ROOT / "data" / "reading-flow" / f"{font_fixture['libraryID']}-{font_fixture['ownerKey']}.json").read_text(encoding="utf-8"))
+        result["cleanupChecks"].append({"name": "chosen pyramid font size survives process exit", "passed": font_draft.get("pyramidFontSize") == font_fixture["value"], "evidence": "Read-only persisted font-size preference inside this note draft"})
     result["isolatedProcessExit"] = exit_evidence
     result["package"] = {"filename": package.name, "bytes": package.stat().st_size, "sha256": hashlib.sha256(package.read_bytes()).hexdigest(), "runtimeFileCount": len(comparisons), "sourceComparisons": comparisons}
     result["shutdownBaseline"] = {

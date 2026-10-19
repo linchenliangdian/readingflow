@@ -11,6 +11,13 @@
   const MAX_DEPTH = 8;
   const MAX_TEXT = 20000;
   const MAX_ROOT_TEXT = MAX_TEXT * 2 + 2;
+  const DEFAULT_PYRAMID_FONT_SIZE = 14;
+  const PYRAMID_FONT_SIZES = Object.freeze([10, 12, 14, 16, 18, 20, 24, 28, 32]);
+
+  function normalizePyramidFontSize(value) {
+    return Number.isFinite(value) && Number.isInteger(value) && PYRAMID_FONT_SIZES.includes(value)
+      ? value : DEFAULT_PYRAMID_FONT_SIZE;
+  }
 
   function uid() {
     if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
@@ -94,7 +101,7 @@
       timers: { inspection: newTimer(DURATIONS.inspection), analysis: newTimer(DURATIONS.analysis) },
       inspection: { question: "", structure: "", checklist: [false, false, false, false, false, false], completed: false, classified: false, legacyChecklist: [] },
       noteKey: null,
-      terms: [], pyramid,
+      terms: [], pyramid, pyramidFontSize: DEFAULT_PYRAMID_FONT_SIZE,
       framing: { situation: "", complication: "", question: "" },
       checks: { summary: false, sameKind: false, order: false, coverage: false },
       reflection: { unresolved: "", nextStep: "" },
@@ -190,6 +197,7 @@
     }));
     base.pyramid = node(raw.pyramid || base.pyramid, 0);
     base.pyramid.id = "root";
+    base.pyramidFontSize = normalizePyramidFontSize(raw.pyramidFontSize);
     base.framing = { situation: text(raw.framing && raw.framing.situation), complication: text(raw.framing && raw.framing.complication), question: text(raw.framing && raw.framing.question) };
     // The former question and answer fields now share one root text area. Clearing
     // the consumed field makes repeated normalization and reopening idempotent.
@@ -450,12 +458,18 @@
 
   function layoutPyramid(raw, now = Date.now()) {
     const s = normalizeSession(raw, raw.item, now);
-    const width = 240, gap = 26, padding = 20, rowGap = 48, lineHeight = 20;
+    const fontSize = s.pyramidFontSize;
+    // Keep cards at one width so a larger font also remains larger when the
+    // complete diagram is fitted into a note. Reflow text and grow only height.
+    const width = 240, gap = 26, padding = 20, rowGap = 48;
+    const maxUnits = Math.min(15, (width - 28) / fontSize);
+    const lineHeight = Math.max(20, Math.ceil(fontSize * 1.4));
+    const baselineOffset = 9 + fontSize;
     const nodes = [], levels = [];
     function measure(n, depth, parentID) {
-      const { lines, lineRuns, lineUnits } = wrapDiagramText(n.text || (depth === 0 ? '主题／核心观点' : '论点／理由'), n.boldRanges);
+      const { lines, lineRuns, lineUnits } = wrapDiagramText(n.text || (depth === 0 ? '主题／核心观点' : '论点／理由'), n.boldRanges, maxUnits);
       function append(value) {
-        const wrapped = wrapDiagramText(value);
+        const wrapped = wrapDiagramText(value, null, maxUnits);
         lines.push(...wrapped.lines); lineRuns.push(...wrapped.lineRuns); lineUnits.push(...wrapped.lineUnits);
       }
       if (n.source) append('出处：' + n.source);
@@ -473,7 +487,7 @@
       for (const [label, content] of [['背景：', s.framing.situation], ['冲突：', s.framing.complication]]) {
         if (!content) continue;
         if (lines.length) { lines.push(''); lineRuns.push([]); lineUnits.push(0); }
-        const wrapped = wrapDiagramText(label + content);
+        const wrapped = wrapDiagramText(label + content, null, maxUnits);
         lines.push(...wrapped.lines); lineRuns.push(...wrapped.lineRuns); lineUnits.push(...wrapped.lineUnits);
       }
       annotation = { lines, lineRuns, lineUnits, width, height: Math.max(64, lines.length * lineHeight + 28), x: 0, y: padding };
@@ -489,7 +503,7 @@
     const leftMargin = annotation ? Math.max(padding, padding + annotation.width + gap - (tree.span - width) / 2) : padding;
     position(tree, leftMargin);
     if (annotation) annotation.x = tree.x - annotation.width - gap;
-    return { width: tree.span + leftMargin + padding, height: yPositions[levels.length - 1] + levels[levels.length - 1] + padding, nodes, annotation, lineHeight };
+    return { width: tree.span + leftMargin + padding, height: yPositions[levels.length - 1] + levels[levels.length - 1] + padding, nodes, annotation, lineHeight, fontSize, baselineOffset };
   }
 
   function renderPyramidSVG(raw, now = Date.now()) {
@@ -503,9 +517,9 @@
     }
     function boxSVG(n, isAnnotation) {
       let result = '<rect x="' + n.x + '" y="' + n.y + '" width="' + n.width + '" height="' + n.height + '" fill="white" stroke="black" stroke-width="1.3"' + (isAnnotation ? ' stroke-dasharray="4 3"' : '') + '/>';
-      result += '<text fill="black" font-size="14" font-family="Arial, Microsoft YaHei, sans-serif" xml:space="preserve">';
+      result += '<text fill="black" font-size="' + layout.fontSize + '" font-family="Arial, Microsoft YaHei, sans-serif" xml:space="preserve">';
       n.lineRuns.forEach((runs, i) => {
-        result += '<tspan x="' + (n.x + 14) + '" y="' + (n.y + 23 + i * layout.lineHeight) + '">' +
+        result += '<tspan x="' + (n.x + 14) + '" y="' + (n.y + layout.baselineOffset + i * layout.lineHeight) + '">' +
           runs.map(run => run.bold ? '<tspan font-weight="700">' + escapeHTML(run.text) + '</tspan>' : escapeHTML(run.text)).join('') + '</tspan>';
       });
       return result + '</text>';
@@ -518,5 +532,5 @@
     }
     return svg + '</svg>';
   }
-  return { VERSION, DURATIONS, MAX_NODES, MAX_DEPTH, MAX_ROOT_TEXT, uid, createSession, normalizeSession, normalizeBoldRanges, getTextRuns, getTimerView, startTimer, pauseTimer, resetTimer, completePhase, findNode, addTerm, removeTerm, addNode, removeNode, moveNode, escapeHTML, renderRichTextHTML, renderNoteHTML, renderStarterNoteHTML, layoutPyramid, renderPyramidSVG };
+  return { VERSION, DURATIONS, MAX_NODES, MAX_DEPTH, MAX_ROOT_TEXT, DEFAULT_PYRAMID_FONT_SIZE, PYRAMID_FONT_SIZES, normalizePyramidFontSize, uid, createSession, normalizeSession, normalizeBoldRanges, getTextRuns, getTimerView, startTimer, pauseTimer, resetTimer, completePhase, findNode, addTerm, removeTerm, addNode, removeNode, moveNode, escapeHTML, renderRichTextHTML, renderNoteHTML, renderStarterNoteHTML, layoutPyramid, renderPyramidSVG };
 });

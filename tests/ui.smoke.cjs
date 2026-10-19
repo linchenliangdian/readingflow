@@ -154,6 +154,113 @@ async function boldEditingRegression(context) {
   } finally { await page.close(); }
 }
 
+async function fontSizingRegression(context) {
+  const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); page.on('dialog', dialog => dialog.accept());
+  const state = () => page.evaluate(() => window.ReadingFlowApp.getState());
+  const chooseSize = size => page.getByRole('combobox', { name: '金字塔字号', exact: true }).selectOption(String(size));
+  try {
+    await page.goto(pathToFileURL(path.join(project, 'content', 'app.xhtml')).href);
+    await page.waitForFunction(() => window.ReadingFlowApp && window.ReadingFlowApp.getState());
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'FONT0001', title: 'Pyramid font size regression' }, initial = window.ReadingFlowCore.createSession(item);
+      initial.pyramid.text = 'HgH\nA clear conclusion supported by the evidence. 中文主题😀';
+      initial.pyramid.boldRanges = [{ start: 0, end: 3 }];
+      initial.framing.situation = 'Prior research gives conflicting explanations.';
+      initial.framing.complication = 'The relation between observations and causes remains uncertain.';
+      for (const [group, count] of [4, 3, 3].entries()) {
+        const branch = window.ReadingFlowCore.addNode(initial, 'root');
+        branch.text = 'Argument ' + group + ': evidence from repeated measurements supports this conclusion. '.repeat(3);
+        for (let leaf = 0; leaf < count; leaf++) window.ReadingFlowCore.addNode(initial, branch.id).text = 'Evidence ' + leaf + ': independent field observations reveal consistent changes over time. '.repeat(6);
+      }
+      await window.ReadingFlowApp.loadConfig(window.mockConfig(item, initial));
+    });
+    await page.locator('#pyramid-toggle').click();
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '14');
+    assert.deepEqual(await page.locator('#pyramid-font-size option').evaluateAll(options => options.map(option => Number(option.value))), [10, 12, 14, 16, 18, 20, 24, 28, 32]);
+    assert.equal(await page.evaluate(() => document.getElementById('node-bold').nextElementSibling.contains(document.getElementById('pyramid-font-size'))), true);
+    await selectNodeText(page, 'root', 4, 5);
+    const boldBefore = (await state()).pyramid.boldRanges;
+    await page.evaluate(() => { window.__fontRoot = document.querySelector('[data-node-id="root"] .node-text'); });
+    await chooseSize(24);
+    assert.equal((await state()).pyramidFontSize, 24);
+    assert.deepEqual((await state()).pyramid.boldRanges, boldBefore);
+    assert.equal(await page.evaluate(() => window.__fontRoot === document.querySelector('[data-node-id="root"] .node-text')), true, 'changing size preserves the live editor and selection anchors');
+    const editorSizes = await page.locator('.node-text,.framing-field textarea').evaluateAll(editors => [...new Set(editors.map(editor => getComputedStyle(editor).fontSize))]);
+    assert.deepEqual(editorSizes, ['24px']);
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    assert.equal(await page.evaluate(() => window.__savedState.pyramidFontSize), 24);
+    pass('size control beside bold changes every node and background annotation while retaining live text and bold ranges');
+
+    const exportPixels = async size => {
+      await chooseSize(size);
+      const layout = await page.evaluate(() => window.ReadingFlowCore.layoutPyramid(window.ReadingFlowApp.getState()));
+      const previous = await page.evaluate(() => window.__inserted.length);
+      await page.locator('#insert-pyramid').click();
+      await page.waitForFunction(count => window.__inserted.length > count && !document.getElementById('insert-pyramid').disabled, previous);
+      const image = await page.evaluate(() => window.__inserted.at(-1));
+      const inkHeight = await page.evaluate(async ({ layout, image }) => {
+        const img = document.createElement('img'); img.src = image.pngDataURL; await img.decode();
+        const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+        const context = canvas.getContext('2d', { willReadFrequently: true }); context.drawImage(img, 0, 0);
+        const root = layout.nodes[0], sx = image.width / layout.width, sy = image.height / layout.height;
+        // Inspect only the first text line, away from the black card border and connecting lines.
+        const x = Math.ceil((root.x + 12) * sx), y = Math.ceil((root.y + 3) * sy);
+        const width = Math.floor((root.width - 24) * sx), height = Math.floor((layout.baselineOffset + layout.fontSize * 0.25 - 3) * sy);
+        const pixels = context.getImageData(x, y, width, height).data, rows = [];
+        for (let row = 0; row < height; row++) {
+          for (let col = 0; col < width; col++) {
+            const offset = (row * width + col) * 4;
+            if (pixels[offset] < 128 && pixels[offset + 1] < 128 && pixels[offset + 2] < 128 && pixels[offset + 3] > 200) { rows.push(row); break; }
+          }
+        }
+        if (!rows.length) throw new Error('Exported first-line glyphs were absent from the PNG');
+        return rows.at(-1) - rows[0] + 1;
+      }, { layout, image });
+      assert.ok(image.width <= 4096 && image.height <= 4096 && image.width * image.height <= 8000000, 'PNG remains within its documented bounds: ' + image.width + '×' + image.height + '=' + image.width * image.height);
+      fs.writeFileSync(path.join(output, screenshotName('pyramid-font-' + size)), Buffer.from(image.pngDataURL.split(',')[1], 'base64'));
+      return { ...image, layout, inkHeight, fittedInkHeight: inkHeight * Math.min(1, 1200 / image.width) };
+    };
+    const normal = await exportPixels(14), large = await exportPixels(32);
+    assert.equal(large.layout.width, normal.layout.width);
+    assert.ok(large.inkHeight > normal.inkHeight * 1.5, 'actual rasterized glyphs grow on a broad ten-leaf diagram');
+    assert.ok(large.fittedInkHeight > normal.fittedInkHeight * 1.5, 'PNG caps and fitting the full diagram into a 1200px note do not cancel the chosen size');
+    fs.writeFileSync(path.join(output, 'pyramid-font-render-metrics-' + version + '.json'), JSON.stringify([normal, large].map(value => ({ fontSize: value.layout.fontSize, diagramWidth: value.layout.width, diagramHeight: value.layout.height, pngWidth: value.width, pngHeight: value.height, inkHeight: value.inkHeight, fittedInkHeight: value.fittedInkHeight })), null, 2));
+    pass('exported ten-leaf PNG contains visibly larger glyph pixels after rasterization and note-width fitting');
+
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    await page.locator('#more-toggle').click(); await page.locator('#backup-export').click();
+    assert.equal(await page.evaluate(() => window.__backup.pyramidFontSize), 32);
+    await chooseSize(10);
+    await page.evaluate(() => { window.__import = JSON.parse(JSON.stringify(window.__backup)); });
+    await page.locator('#backup-import').click();
+    await page.waitForFunction(() => window.ReadingFlowApp.getState().pyramidFontSize === 32 && !document.getElementById('pyramid-font-size').disabled);
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '32');
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    await page.reload(); await page.waitForFunction(() => window.ReadingFlowApp && window.ReadingFlowApp.getState());
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'FONT0001', title: 'Pyramid font size regression' };
+      await window.ReadingFlowApp.loadConfig(window.mockConfig(item, JSON.parse(localStorage.getItem('rf-tools-test-' + item.key))));
+    });
+    await page.locator('#pyramid-toggle').click();
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '32');
+    assert.equal((await state()).pyramidFontSize, 32);
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'FONT0002', title: 'Another note keeps its own size' };
+      await window.ReadingFlowApp.loadConfig(window.mockConfig(item, null));
+    });
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '14');
+    await chooseSize(20);
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'FONT0001', title: 'Pyramid font size regression' };
+      await window.ReadingFlowApp.loadConfig(window.mockConfig(item, JSON.parse(localStorage.getItem('rf-tools-test-' + item.key))));
+    });
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '32');
+    assert.deepEqual((await state()).pyramid.boldRanges, boldBefore);
+    pass('each note restores its own size through autosave, JSON import/export, reload and note switching');
+  } finally { await page.close(); }
+}
+
 async function resizingIframeRegression(browser) {
   const fixtureSource = pathToFileURL(path.join(process.env.READING_FLOW_TEST_RESIZE_CONTENT || path.join(project, 'content'), 'app.xhtml')).href;
   const hostHTML = '<!doctype html><meta charset="utf-8"><style>body{margin:0}#panel{display:flex;flex-direction:column;width:730px;height:600px}iframe{border:0;width:100%;height:58px;flex:none}#native{flex:1;min-height:80px;background:#eee}</style><div id="panel"><iframe id="toolsFrame" src="' + fixtureSource + '"></iframe><div id="native"></div></div><script>' +
@@ -547,6 +654,11 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).getAttribute('contenteditable'), 'false');
     assert.equal(await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).getAttribute('aria-disabled'), 'true');
     assert.equal(await page.locator('#node-bold').isDisabled(), true);
+    assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
+    const readOnlySize = await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize);
+    await page.locator('#pyramid-font-size').evaluate(select => { select.value = '32'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize), readOnlySize);
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), String(readOnlySize));
     assert.equal(await page.locator('#framing-situation').isDisabled(), true);
     assert.equal(await page.locator('#framing-complication').isDisabled(), true);
     assert.equal(await page.locator('#node-child').isDisabled(), true);
@@ -576,6 +688,10 @@ async function manualHeightRegression(browser) {
     await page.getByRole('textbox', { name: '主题／核心观点', exact: true }).fill('插入开始时的文献 A');
     await page.locator('#insert-pyramid').click();
     await page.waitForFunction(() => window.__saveBlocked);
+    assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
+    const busySize = await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize);
+    await page.locator('#pyramid-font-size').evaluate(select => { select.value = '32'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize), busySize);
     await page.evaluate(async () => {
       const item = { libraryID: 1, key: 'PAPER004', title: 'Fourth paper' };
       await window.ReadingFlowApp.loadConfig(window.mockConfig(item, null));
@@ -599,7 +715,8 @@ async function manualHeightRegression(browser) {
     pass('an in-flight import cannot replace the new paper after configuration changes');
     await page.evaluate(async () => {
       const item = { libraryID: 1, key: 'SYNC0001', title: '同步版本选择' }, first = window.ReadingFlowCore.createSession(item), second = window.ReadingFlowCore.createSession(item);
-      first.pyramid.text = '电脑 A 的核心观点'; first.framing.situation = '版本 A 背景'; second.pyramid.text = '电脑 B 保留的观点'; second.pyramid.boldRanges = [{ start: 0, end: 4 }];
+      first.pyramid.text = '电脑 A 的核心观点'; first.framing.situation = '版本 A 背景'; first.pyramidFontSize = 20;
+      second.pyramid.text = '电脑 B 保留的观点'; second.pyramid.boldRanges = [{ start: 0, end: 4 }]; second.pyramidFontSize = 28;
       const config = window.mockConfig(item, first);
       Object.assign(config, { readOnly: true, syncConflict: true, selectedSyncVersion: 'a', syncCanResolve: true, syncVersions: [{ id: 'a', label: '电脑 A', state: first }, { id: 'b', label: '电脑 B', state: second }] });
       config.bridge.canEdit = false;
@@ -611,9 +728,15 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.locator('#sync-version').evaluate(node => node.value), 'a');
     assert.equal(await page.locator('#start-inspection').isDisabled(), true);
     assert.equal(await page.locator('#node-child').isDisabled(), true);
+    assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '20');
     await page.locator('#sync-version').evaluate(node => { node.value = 'b'; node.dispatchEvent(new Event('change', { bubbles: true })); });
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramid.text), '电脑 B 保留的观点');
     assert.equal(await page.locator('[data-node-id="root"] strong').textContent(), '电脑 B');
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '28');
+    assert.equal(await page.locator('[data-node-id="root"] .node-text').evaluate(editor => getComputedStyle(editor).fontSize), '28px');
+    await page.locator('#pyramid-font-size').evaluate(select => { select.value = '10'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize), 28);
     await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
     assert.equal(await page.evaluate(() => window.__saves.length), await page.evaluate(() => window.__conflictSaveCount));
     await page.evaluate(() => { window.__conflictFlushes = 0; window.__conflictBridge.flushState = () => { window.__conflictFlushes++; }; window.dispatchEvent(new Event('beforeunload')); });
@@ -624,15 +747,19 @@ async function manualHeightRegression(browser) {
     await page.waitForFunction(() => window.__chosenSyncVersion === 'b' && document.getElementById('sync-area').hidden);
     assert.equal(await page.locator('#start-inspection').isDisabled(), false);
     assert.equal(await page.locator('[data-node-id="root"] .node-text').getAttribute('contenteditable'), 'true');
+    assert.equal(await page.locator('#pyramid-font-size').isDisabled(), false);
+    assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), '28');
     assert.match(await page.locator('#status').textContent(), /已采用所选版本/);
     pass('choosing a preserved version explicitly resumes editable tools');
     await page.evaluate(async () => { const current = window.ReadingFlowApp.getState(), config = window.mockConfig(current.item, current); Object.assign(config, { readOnly: true, syncPending: true }); config.bridge.canEdit = false; await window.ReadingFlowApp.loadConfig(config); });
     assert.equal(await page.locator('#node-child').isDisabled(), true);
     assert.equal(await page.locator('#start-analysis').isDisabled(), true);
+    assert.equal(await page.locator('#pyramid-font-size').isDisabled(), true);
     assert.equal(await page.locator('#sync-area').isVisible(), false);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramid.text), '电脑 B 保留的观点');
     pass('incomplete synchronized data preserves the current tree and prevents premature writes');
     await boldEditingRegression(context);
+    await fontSizingRegression(context);
     await resizingIframeRegression(browser);
     await manualHeightRegression(browser);
     assert.deepEqual(errors, []); pass('no browser JavaScript errors');

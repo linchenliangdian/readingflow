@@ -89,13 +89,38 @@ test('sync codec preserves Unicode and HTML-like text while producing bounded or
 });
 
 test('a fresh second device reconstructs the editable pyramid using only synced native records and portable keys', async () => {
-  const a = device(), b = device({ libraryID: 27, name: 'B' }), { state } = await publish(a); b.receive(a);
+  const a = device(), b = device({ libraryID: 27, name: 'B' }), { state } = await publish(a, { ...stateFor(a), pyramidFontSize: 24 }); b.receive(a);
   assert.notEqual(a.owner.id, b.owner.id); assert.notEqual(a.owner.libraryID, b.owner.libraryID);
   const loaded = await b.store.load(b.identity(b.owner)); assert.equal(loaded.conflict, false); assert.equal(loaded.hasRemote, true);
   assert.equal(loaded.state.item.libraryID, 27); assert.equal(loaded.state.item.key, a.owner.key); assert.equal(loaded.state.pyramid.text, state.pyramid.text);
   assert.deepEqual(loaded.state.pyramid.boldRanges, state.pyramid.boldRanges); assert.deepEqual(loaded.state.framing, state.framing);
+  assert.equal(loaded.state.pyramidFontSize, 24, 'font size belongs to synced note data, not this device preferences or files');
   assert.equal(loaded.state.pyramid.children[0].text, 'Evidence 证据'); assert.equal(b.writes.length, 0);
   assert.equal(b.prefs.get(sync.DEVICE_PREF), 'device-B');
+});
+
+test('concurrent size-only changes preserve both reading layouts until an explicit version is adopted', async () => {
+  const a = device(), b = device({ name: 'B' }), first = await publish(a); b.receive(a);
+  const baseB = await b.store.load(b.identity(b.owner)), stateA = clone(first.state);
+  stateA.pyramidFontSize = 24;
+  baseB.state.pyramidFontSize = 32;
+  await a.store.save(a.identity(a.owner), stateA, first.saved.token);
+  await b.store.save(b.identity(b.owner), baseB.state, baseB.token);
+  a.receive(b, { filter: note => sync.decodeNote(note.getNote()).deviceID === 'device-B' }); b.receive(a);
+  const conflict = await a.store.load(a.identity(a.owner));
+  assert.equal(conflict.conflict, true);
+  assert.deepEqual(new Set(conflict.versions.map(value => value.state.pyramidFontSize)), new Set([24, 32]));
+  assert.deepEqual(new Set(conflict.versions.map(value => value.state.pyramid.text)), new Set([first.state.pyramid.text]));
+  const count = a.writes.length;
+  await assert.rejects(() => a.store.save(a.identity(a.owner), conflict.state, conflict.token), /多个版本|选择版本/);
+  assert.equal(a.writes.length, count);
+  const chosen = conflict.versions.find(value => value.state.pyramidFontSize === 32);
+  await a.store.save(a.identity(a.owner), chosen.state, conflict.token, { resolve: true });
+  b.receive(a);
+  const resolved = await b.store.load(b.identity(b.owner));
+  assert.equal(resolved.conflict, false);
+  assert.equal(resolved.state.pyramidFontSize, 32);
+  assert.deepEqual(resolved.state.pyramid.boldRanges, first.state.pyramid.boldRanges);
 });
 
 test('a causally newer remote edit replaces a clean local cache regardless of wall-clock timestamps', async () => {

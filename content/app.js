@@ -186,6 +186,7 @@
     updateNodeControls();
   }
   function updateNodeControls() {
+    updateFontSizeControl();
     if (!state) return;
     const node = selectedNode(), parent = findParent(node.id), index = parent ? parent.children.indexOf(node) : -1;
     $("selected-label").textContent = parent ? ({ thesis: "主题", argument: "论点", evidence: "理由" }[node.type]) : "顶层";
@@ -196,6 +197,12 @@
     $("node-down").disabled = readOnly || !parent || index >= parent.children.length - 1;
     $("insert-pyramid").disabled = readOnly || actionBusy || !bridge || typeof bridge.insertPyramid !== "function";
     updateBoldControl();
+  }
+  function updateFontSizeControl() {
+    const size = Core.normalizePyramidFontSize(state && state.pyramidFontSize);
+    $("pyramid-font-size").value = String(size);
+    $("pyramid-font-size").disabled = !state || readOnly || syncBlocked || actionBusy;
+    $("diagram").style.setProperty("--pyramid-font-size", size + "px");
   }
   function selectionInEditor() {
     const selection = window.getSelection();
@@ -380,7 +387,8 @@
       await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = () => reject(new Error("无法生成金字塔图片。")); img.src = source; });
       const originalWidth = img.naturalWidth || 600, originalHeight = img.naturalHeight || 300;
       const scale = Math.min(1, 4096 / originalWidth, 4096 / originalHeight, Math.sqrt(8000000 / (originalWidth * originalHeight)));
-      const width = Math.max(1, Math.round(originalWidth * scale)), height = Math.max(1, Math.round(originalHeight * scale));
+      // Round down so a size-limited image cannot exceed the bridge's pixel cap.
+      const width = Math.max(1, Math.floor(originalWidth * scale)), height = Math.max(1, Math.floor(originalHeight * scale));
       const canvas = el("canvas"); canvas.width = width; canvas.height = height;
       const ctx = canvas.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, width, height); ctx.drawImage(img, 0, 0, width, height);
       return { pngDataURL: canvas.toDataURL("image/png"), width, height };
@@ -468,6 +476,18 @@
     });
     $("node-bold").addEventListener("mousedown", event => event.preventDefault());
     $("node-bold").addEventListener("click", applyBold);
+    Core.PYRAMID_FONT_SIZES.forEach(size => {
+      const option = el("option", "", String(size)); option.value = String(size); $("pyramid-font-size").appendChild(option);
+    });
+    updateFontSizeControl();
+    $("pyramid-font-size").addEventListener("change", () => {
+      if (!state || readOnly || syncBlocked || actionBusy) { updateFontSizeControl(); return; }
+      const size = Core.normalizePyramidFontSize(Number($("pyramid-font-size").value));
+      if (size === state.pyramidFontSize) return;
+      state.pyramidFontSize = size;
+      // Keep the existing editing DOM, text selection and partial bold ranges intact.
+      updateFontSizeControl(); changed(); resize();
+    });
     document.addEventListener("selectionchange", rememberSelection);
     $("inspection-completed").addEventListener("change", () => { if (!state || readOnly) return; state.inspection.completed = $("inspection-completed").checked; if (state.inspection.completed && state.phase === "inspection") Core.completePhase(state); changed(); updateTimer(); });
     $("node-child").addEventListener("click", () => { if (!state || readOnly) return; try { const node = selectedNode(), child = Core.addNode(state, node.id, node.type === "thesis" ? "argument" : "evidence"); selectedID = child.id; changed(); renderDiagram(child.id); } catch (error) { status(error.message, true); } });
