@@ -199,6 +199,10 @@
     base.pyramid.id = "root";
     base.pyramidFontSize = normalizePyramidFontSize(raw.pyramidFontSize);
     base.framing = { situation: text(raw.framing && raw.framing.situation), complication: text(raw.framing && raw.framing.complication), question: text(raw.framing && raw.framing.question) };
+    for (const key of ["situation", "complication"]) {
+      const ranges = normalizeBoldRanges(raw.framing && raw.framing[key + "BoldRanges"], base.framing[key]);
+      if (ranges.length) base.framing[key + "BoldRanges"] = ranges;
+    }
     // The former question and answer fields now share one root text area. Clearing
     // the consumed field makes repeated normalization and reopening idempotent.
     if (base.framing.question) {
@@ -320,7 +324,7 @@
       return run.bold && html ? "<strong>" + html + "</strong>" : html;
     }).join("");
   }
-  function paragraph(label, value) { return "<p><strong>" + label + "：</strong>" + (value ? escapeHTML(value).replace(/\n/g, "<br />") : "（待填写）") + "</p>"; }
+  function paragraph(label, value, ranges) { return "<p><strong>" + label + "：</strong>" + (value ? renderRichTextHTML(value, ranges) : "（待填写）") + "</p>"; }
   function renderNoteHTML(raw, now = Date.now()) {
     const s = normalizeSession(raw, raw.item, now);
     const labels = { thesis: "结论", argument: "论点", evidence: "支撑／证据" };
@@ -343,7 +347,7 @@
     html += "<h2>关键术语</h2>";
     if (s.terms.length) html += "<table><tbody><tr><th>术语</th><th>用自己的话解释</th><th>出处</th><th>疑问标记</th></tr>" + s.terms.map(t => "<tr><td>" + escapeHTML(t.term) + "</td><td>" + escapeHTML(t.meaning).replace(/\n/g, "<br />") + "</td><td>" + escapeHTML(t.source) + "</td><td>" + (t.uncertain ? "待核实" : "未标记疑问") + "</td></tr>").join("") + "</tbody></table>";
     else html += "<p>（暂无术语）</p>";
-    if (s.framing.situation || s.framing.complication) html += "<h2>序言线索</h2>" + paragraph("情境 S", s.framing.situation) + paragraph("冲突 C", s.framing.complication);
+    if (s.framing.situation || s.framing.complication) html += "<h2>序言线索</h2>" + paragraph("情境 S", s.framing.situation, s.framing.situationBoldRanges) + paragraph("冲突 C", s.framing.complication, s.framing.complicationBoldRanges);
     html += "<h2>金字塔</h2><ol>" + nodeHTML(s.pyramid) + "</ol>";
     html += "<h2>逻辑自检（读者判断）</h2><ul>" + [
       ["summary", "上层概括下层，下层回答上层引出的疑问"],
@@ -364,8 +368,8 @@
     html += line('疑问／回答', s.pyramid.text, s.pyramid.boldRanges);
     if (s.inspection.question) html += line('检视时的研究问题', s.inspection.question);
     html += line('主要部分及其联系', s.inspection.structure);
-    if (s.framing.situation) html += line('背景', s.framing.situation);
-    if (s.framing.complication) html += line('冲突', s.framing.complication);
+    if (s.framing.situation) html += line('背景', s.framing.situation, s.framing.situationBoldRanges);
+    if (s.framing.complication) html += line('冲突', s.framing.complication, s.framing.complicationBoldRanges);
     if (s.inspection.classified) html += '<p>已在 reading_list.xlsx 中完成分类。</p>';
     html += '<h2>术语与命题</h2>';
     html += '<p><strong>主要术语：</strong>作者的含义 · 自己的解释</p>';
@@ -484,10 +488,11 @@
     let annotation = null;
     if (s.framing.situation || s.framing.complication) {
       const lines = [], lineRuns = [], lineUnits = [];
-      for (const [label, content] of [['背景：', s.framing.situation], ['冲突：', s.framing.complication]]) {
+      for (const [label, content, ranges] of [['背景：', s.framing.situation, s.framing.situationBoldRanges], ['冲突：', s.framing.complication, s.framing.complicationBoldRanges]]) {
         if (!content) continue;
         if (lines.length) { lines.push(''); lineRuns.push([]); lineUnits.push(0); }
-        const wrapped = wrapDiagramText(label + content, null, maxUnits);
+        const shiftedRanges = (ranges || []).map(range => ({ start: range.start + label.length, end: range.end + label.length }));
+        const wrapped = wrapDiagramText(label + content, shiftedRanges, maxUnits);
         lines.push(...wrapped.lines); lineRuns.push(...wrapped.lineRuns); lineUnits.push(...wrapped.lineUnits);
       }
       annotation = { lines, lineRuns, lineUnits, width, height: Math.max(64, lines.length * lineHeight + 28), x: 0, y: padding };

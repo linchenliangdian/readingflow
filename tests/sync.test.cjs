@@ -72,6 +72,7 @@ function device({ libraryID = 1, name = 'A' } = {}) {
 function stateFor(d, owner = d.owner, text = 'A conclusion') {
   const state = core.createSession(d.identity(owner)); state.pyramid.text = text; state.noteKey = owner.isNote() ? owner.key : 'PROSE001';
   state.pyramid.boldRanges = [{ start: 0, end: 1 }]; state.framing.situation = 'Background 背景'; state.framing.complication = 'Conflict 冲突';
+  state.framing.situationBoldRanges = [{ start: 0, end: 10 }]; state.framing.complicationBoldRanges = [{ start: 9, end: 11 }];
   core.addNode(state, state.pyramid.id, 'child'); state.pyramid.children[0].text = 'Evidence 证据'; return state;
 }
 async function publish(d, state = stateFor(d), owner = d.owner) {
@@ -120,6 +121,26 @@ test('concurrent size-only changes preserve both reading layouts until an explic
   const resolved = await b.store.load(b.identity(b.owner));
   assert.equal(resolved.conflict, false);
   assert.equal(resolved.state.pyramidFontSize, 32);
+  assert.deepEqual(resolved.state.pyramid.boldRanges, first.state.pyramid.boldRanges);
+});
+
+test('concurrent annotation-format-only changes preserve both branches until one is explicitly adopted', async () => {
+  const a = device(), b = device({ name: 'B' }), first = await publish(a); b.receive(a);
+  const baseB = await b.store.load(b.identity(b.owner)), stateA = clone(first.state);
+  stateA.framing.situationBoldRanges = [{ start: 11, end: 13 }];
+  baseB.state.framing.complicationBoldRanges = [{ start: 0, end: 8 }];
+  await a.store.save(a.identity(a.owner), stateA, first.saved.token);
+  await b.store.save(b.identity(b.owner), baseB.state, baseB.token);
+  a.receive(b, { filter: note => sync.decodeNote(note.getNote()).deviceID === 'device-B' }); b.receive(a);
+  const conflict = await a.store.load(a.identity(a.owner));
+  assert.equal(conflict.conflict, true);
+  assert.deepEqual(new Set(conflict.versions.map(value => JSON.stringify(value.state.framing))), new Set([JSON.stringify(stateA.framing), JSON.stringify(baseB.state.framing)]));
+  assert.deepEqual(new Set(conflict.versions.map(value => value.state.pyramid.text)), new Set([first.state.pyramid.text]));
+  const chosen = conflict.versions.find(value => value.state.framing.complicationBoldRanges[0].start === 0);
+  await a.store.save(a.identity(a.owner), chosen.state, conflict.token, { resolve: true }); b.receive(a);
+  const resolved = await b.store.load(b.identity(b.owner));
+  assert.equal(resolved.conflict, false);
+  assert.deepEqual(resolved.state.framing, baseB.state.framing);
   assert.deepEqual(resolved.state.pyramid.boldRanges, first.state.pyramid.boldRanges);
 });
 

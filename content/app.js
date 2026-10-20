@@ -6,6 +6,7 @@
   let selectedID = "root", revision = 0, savedRevision = 0, saving = null, saveTimeout = null;
   let actionBusy = false, configQueue = Promise.resolve(), lastHeight = 0, generation = 0;
   let boldSelection = null, framingVisible = false;
+  const editorModels = new WeakMap();
   let manualHeight = null, lastManualMode = null, heightDrag = null;
   let sizing = { requestedHeight: 54, allocatedHeight: 0, intrinsicHeaderHeight: 54, naturalDiagramHeight: 0, diagramViewportHeight: 0 };
   const expired = new Set();
@@ -210,12 +211,12 @@
     const range = selection.getRangeAt(0);
     const element = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
     const editor = element && element.closest(".node-text");
-    if (!editor || !editor.isConnected || editor.getAttribute("contenteditable") !== "true" || !editor.contains(range.endContainer)) return null;
+    if (!editor || !editorModels.has(editor) || !editor.isConnected || editor.getAttribute("contenteditable") !== "true" || !editor.contains(range.endContainer)) return null;
     return { editor, range: range.cloneRange() };
   }
   function updateBoldControl() {
     const valid = boldSelection && boldSelection.editor.isConnected && boldSelection.editor.getAttribute("contenteditable") === "true";
-    $("node-bold").disabled = readOnly || !valid;
+    $("node-bold").disabled = readOnly || syncBlocked || actionBusy || !valid;
     let pressed = false;
     if (valid) { try { pressed = document.queryCommandState("bold"); } catch (_) {} }
     $("node-bold").setAttribute("aria-pressed", String(pressed));
@@ -262,8 +263,11 @@
       else editor.appendChild(text);
     });
   }
-  function syncEditor(editor, node, composing) {
-    const value = editorContents(editor), limit = node === state.pyramid ? Core.MAX_ROOT_TEXT : 20000;
+  function syncEditor(editor, composing) {
+    const model = editorModels.get(editor);
+    if (!state || readOnly || syncBlocked || !editor.isConnected || !model) return;
+    const { target, textKey, rangesKey, limit } = model;
+    const value = editorContents(editor);
     if (!composing && value.text.length > limit) {
       value.text = value.text.slice(0, limit);
       if (/[\uD800-\uDBFF]$/.test(value.text)) value.text = value.text.slice(0, -1);
@@ -273,9 +277,9 @@
       const range = document.createRange(); range.selectNodeContents(editor); range.collapse(false);
       selection.removeAllRanges(); selection.addRange(range);
     }
-    if (node.text !== value.text || JSON.stringify(node.boldRanges || []) !== JSON.stringify(value.boldRanges)) {
-      node.text = value.text;
-      if (value.boldRanges.length) node.boldRanges = value.boldRanges; else delete node.boldRanges;
+    if (target[textKey] !== value.text || JSON.stringify(target[rangesKey] || []) !== JSON.stringify(value.boldRanges)) {
+      target[textKey] = value.text;
+      if (value.boldRanges.length) target[rangesKey] = value.boldRanges; else delete target[rangesKey];
       changed();
     }
     rememberSelection(); resize();
@@ -284,43 +288,38 @@
     const current = selectionInEditor();
     if (!current) { boldSelection = null; updateBoldControl(); return; }
     boldSelection = current;
-    if (readOnly || !state || !boldSelection || !boldSelection.editor.isConnected) return;
-    const { editor, range } = boldSelection, card = editor.closest("[data-node-id]");
-    const node = Core.findNode(state.pyramid, card.getAttribute("data-node-id"));
-    if (!node || !editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return;
+    if (readOnly || syncBlocked || actionBusy || !state || !boldSelection || !boldSelection.editor.isConnected) return;
+    const { editor, range } = boldSelection;
+    if (!editorModels.has(editor) || !editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return;
     editor.focus();
     const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
     document.execCommand("bold", false, null);
-    syncEditor(editor, node, false);
+    syncEditor(editor, false);
   }
-  function richArea(parent, node, root) {
+  function richArea(parent, node, root, options = {}) {
     const input = el("div", "node-text");
-    input.setAttribute("contenteditable", String(!readOnly)); input.setAttribute("role", "textbox");
-    input.setAttribute("aria-multiline", "true"); input.setAttribute("aria-disabled", String(readOnly));
-    input.setAttribute("aria-label", root ? "疑问／回答" : "节点内容");
-    input.setAttribute("data-placeholder", root ? "疑问与回答，可分行填写。" : "论点或理由，写成一句完整的话。");
-    paintEditor(input, node);
-    input.addEventListener("input", event => syncEditor(input, node, event.isComposing));
-    input.addEventListener("compositionend", () => syncEditor(input, node, false));
+    const textKey = options.textKey || "text", rangesKey = options.rangesKey || "boldRanges";
+    editorModels.set(input, { target: node, textKey, rangesKey, limit: root ? Core.MAX_ROOT_TEXT : 20000 });
+    input.setAttribute("contenteditable", String(!readOnly && !syncBlocked)); input.setAttribute("role", "textbox");
+    input.setAttribute("aria-multiline", "true"); input.setAttribute("aria-disabled", String(readOnly || syncBlocked));
+    input.setAttribute("aria-label", options.label || (root ? "疑问／回答" : "节点内容"));
+    input.setAttribute("data-placeholder", options.placeholder !== undefined ? options.placeholder : root ? "疑问与回答，可分行填写。" : "论点或理由，写成一句完整的话。");
+    paintEditor(input, { text: node[textKey], boldRanges: node[rangesKey] });
+    input.addEventListener("input", event => syncEditor(input, event.isComposing));
+    input.addEventListener("compositionend", () => syncEditor(input, false));
     input.addEventListener("keydown", event => {
-      if (readOnly || event.isComposing) return;
+      if (readOnly || syncBlocked || event.isComposing) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") { event.preventDefault(); rememberSelection(); applyBold(); }
       else if ((event.ctrlKey || event.metaKey) && ["i", "u"].includes(event.key.toLowerCase())) event.preventDefault();
-      else if (event.key === "Enter") { event.preventDefault(); document.execCommand("insertText", false, "\n"); syncEditor(input, node, false); }
+      else if (event.key === "Enter") { event.preventDefault(); document.execCommand("insertText", false, "\n"); syncEditor(input, false); }
     });
     input.addEventListener("paste", event => {
-      event.preventDefault(); if (readOnly || !event.clipboardData) return;
-      document.execCommand("insertText", false, event.clipboardData.getData("text/plain")); syncEditor(input, node, false);
+      event.preventDefault(); if (readOnly || syncBlocked || !event.clipboardData) return;
+      document.execCommand("insertText", false, event.clipboardData.getData("text/plain")); syncEditor(input, false);
     });
     input.addEventListener("drop", event => event.preventDefault());
     input.addEventListener("mouseup", rememberSelection);
     input.addEventListener("keyup", rememberSelection);
-    parent.appendChild(input); return input;
-  }
-  function editArea(parent, value, placeholder, label, setter, className) {
-    const input = el("textarea", className || ""); input.value = value || ""; input.placeholder = placeholder; input.rows = 2; input.maxLength = 20000;
-    input.disabled = readOnly; input.setAttribute("aria-label", label);
-    input.addEventListener("input", () => { setter(input.value); changed(); });
     parent.appendChild(input); return input;
   }
   function nodeCard(node, root) {
@@ -351,9 +350,9 @@
     if (framingVisible) {
       const framing = el("aside", "framing-note"); framing.id = "framing-note"; framing.setAttribute("aria-label", "主题注释");
       [["situation", "背景"], ["complication", "冲突"]].forEach(([key, label]) => {
-        const field = el("label", "framing-field"); field.appendChild(el("span", "", label));
-        const input = editArea(field, state.framing[key], "", label, value => { state.framing[key] = value; });
-        input.id = "framing-" + key; input.addEventListener("focus", () => { boldSelection = null; updateBoldControl(); });
+        const field = el("div", "framing-field"); field.appendChild(el("span", "", label));
+        const input = richArea(field, state.framing, false, { textKey: key, rangesKey: key + "BoldRanges", label, placeholder: "" });
+        input.id = "framing-" + key;
         framing.appendChild(field);
       });
       root.appendChild(framing);

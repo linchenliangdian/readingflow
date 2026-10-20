@@ -12,6 +12,10 @@ TEST_ROOT = ROOT / "tmp" / "zotero-test-v2"
 OUTPUT = ROOT / "output"
 
 
+def utf16_slice(value, start, end):
+    return value.encode("utf-16-le")[start * 2:end * 2].decode("utf-16-le")
+
+
 def finalize():
     exit_evidence = json.loads((TEST_ROOT / "process-exit-check.json").read_text(encoding="utf-8-sig"))
     if not exit_evidence.get("passed") or exit_evidence.get("IsolatedCount") != 0:
@@ -60,6 +64,14 @@ def finalize():
         and "实机背景批注" in draft["framing"]["situation"] and "实机冲突批注" in draft["framing"]["complication"],
         "evidence": "Read-only persisted draft after verified isolated process exit",
     }
+    framing_bold_fixture = result.get("framingBold")
+    if not framing_bold_fixture or framing_bold_fixture.get("ownerKey") != parent["key"] or framing_bold_fixture.get("libraryID") != parent["libraryID"]:
+        raise RuntimeError("The native background/complication partial-bold regression must target the first original note")
+    framing_bold_check = {
+        "name": "background and complication partial bold survive application exit",
+        "passed": all(any(utf16_slice(draft["framing"][field], span["start"], span["end"]) == framing_bold_fixture[field] for span in draft["framing"].get(field + "BoldRanges", [])) for field in ("situation", "complication")),
+        "evidence": "Read-only persisted annotation plain strings and UTF-16 range metadata after verified isolated process exit",
+    }
     standalone_fixtures = result.get("standaloneNotes", [])
     if len(standalone_fixtures) != 2:
         raise RuntimeError("The standalone-note regression must verify two original notes")
@@ -101,7 +113,7 @@ def finalize():
     preferences = (TEST_ROOT / "profile" / "prefs.js").read_text(encoding="utf-8")
     preference_pattern = r'user_pref\("' + re.escape(height_preference.get("key", "")) + r'",\s*' + str(expected_height) + r'\);'
     height_check = {"name": "chosen pyramid viewport height survives application exit", "passed": isinstance(expected_height, int) and 64 <= expected_height <= 1600 and height_preference.get("key") == "extensions.zotero.readingFlow.pyramidHeight" and bool(re.search(preference_pattern, preferences)), "evidence": "Read-only isolated profile prefs.js after verified process exit"}
-    result["cleanupChecks"] = [cleanup_check, persisted_check, root_check, formatting_check, standalone_prose_check, standalone_draft_check, standalone_image_check, reader_note_check, reader_draft_check, height_check]
+    result["cleanupChecks"] = [cleanup_check, persisted_check, root_check, formatting_check, framing_bold_check, standalone_prose_check, standalone_draft_check, standalone_image_check, reader_note_check, reader_draft_check, height_check]
     font_fixture = result.get("pyramidFontSize")
     if font_fixture:
         font_draft = json.loads((TEST_ROOT / "data" / "reading-flow" / f"{font_fixture['libraryID']}-{font_fixture['ownerKey']}.json").read_text(encoding="utf-8"))

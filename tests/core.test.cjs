@@ -345,6 +345,56 @@ test('background and complication render beside the root without changing the tr
   }
 });
 
+test('background and complication formatting stays optional, Unicode-safe and separate through backup normalization', () => {
+  const s = core.createSession(item, now);
+  assert.equal(Object.hasOwn(s.framing, 'situationBoldRanges'), false);
+  assert.equal(Object.hasOwn(s.framing, 'complicationBoldRanges'), false);
+  s.framing.situation = '前言😀 <unsafe>\n背景';
+  s.framing.complication = '冲突 gamma 未知';
+  s.framing.situationBoldRanges = [{ start: 3, end: 4 }, { start: 0, end: 1 }, null, { start: '0', end: 8 }];
+  s.framing.complicationBoldRanges = [{ start: 3, end: 8 }, { start: 50, end: 90 }];
+  const normalized = core.normalizeSession(JSON.parse(JSON.stringify(s)), item, now);
+  assert.equal(normalized.framing.situation, s.framing.situation);
+  assert.equal(normalized.framing.complication, s.framing.complication);
+  assert.deepEqual(normalized.framing.situationBoldRanges, [{ start: 0, end: 1 }, { start: 2, end: 4 }]);
+  assert.deepEqual(normalized.framing.complicationBoldRanges, [{ start: 3, end: 8 }]);
+  assert.equal(Object.hasOwn(normalized.pyramid, 'boldRanges'), false);
+  assert.deepEqual(core.normalizeSession(JSON.parse(JSON.stringify(normalized)), item, now), normalized);
+  assert.equal(s.framing.situationBoldRanges.length, 4, 'normalization does not mutate a supplied backup');
+  normalized.framing.situation = ''; normalized.framing.complicationBoldRanges = '<b>not ranges</b>';
+  const empty = core.normalizeSession(normalized, item, now);
+  assert.equal(Object.hasOwn(empty.framing, 'situationBoldRanges'), false);
+  assert.equal(Object.hasOwn(empty.framing, 'complicationBoldRanges'), false);
+  s.framing.situation = 'x'.repeat(19999) + '😀tail';
+  s.framing.situationBoldRanges = [{ start: 19998, end: 20005 }];
+  const clipped = core.normalizeSession(s, item, now);
+  assert.equal(clipped.framing.situation, 'x'.repeat(19999));
+  assert.deepEqual(clipped.framing.situationBoldRanges, [{ start: 19998, end: 19999 }]);
+});
+
+test('annotation bold survives line wrapping and SVG and HTML exports without leaking onto labels or the root', () => {
+  const s = core.createSession(item, now);
+  s.pyramid.text = 'Plain root';
+  s.framing.situation = '前言😀 <unsafe>\n' + 'long English evidence '.repeat(5);
+  s.framing.complication = '原因 gamma\n\n未知';
+  s.framing.situationBoldRanges = [{ start: 2, end: 12 }, { start: 14, end: 50 }];
+  s.framing.complicationBoldRanges = [{ start: 3, end: 8 }];
+  const normalized = core.normalizeSession(s, item, now), layout = core.layoutPyramid(s, now);
+  const expected = ['situation', 'complication'].map(key => core.getTextRuns(normalized.framing[key], normalized.framing[key + 'BoldRanges']).filter(run => run.bold).map(run => run.text).join('').replace(/\n/g, '')).join('');
+  assert.equal(layout.annotation.lineRuns.flat().filter(run => run.bold).map(run => run.text).join(''), expected);
+  assert.ok(layout.annotation.lineRuns.filter(line => line.some(run => run.bold)).length > 2);
+  assert.ok(!layout.nodes[0].lineRuns.flat().some(run => run.bold));
+  const svg = core.renderPyramidSVG(s, now);
+  const actual = Array.from(svg.matchAll(/<tspan font-weight="700">([^<]*)<\/tspan>/g), match => match[1]).join('');
+  assert.equal(actual, core.escapeHTML(expected));
+  assert.doesNotMatch(svg, /<unsafe>|<script/);
+  for (const html of [core.renderStarterNoteHTML(s, now), core.renderNoteHTML(s, now)]) {
+    assert.ok(html.includes(core.renderRichTextHTML(normalized.framing.situation, normalized.framing.situationBoldRanges)));
+    assert.ok(html.includes(core.renderRichTextHTML(normalized.framing.complication, normalized.framing.complicationBoldRanges)));
+    assert.doesNotMatch(html, /<unsafe>|<script/);
+  }
+});
+
 test('old backups retain the original pyramid size and only supported numeric sizes survive normalization', () => {
   const original = core.createSession(item, now);
   assert.equal(original.pyramidFontSize, 14);

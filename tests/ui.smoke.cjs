@@ -11,7 +11,10 @@ const errors = [], checks = [];
 function pass(name) { checks.push(name); console.log('PASS ' + name); }
 
 async function selectNodeText(page, nodeID, start, end = start) {
-  await page.locator('[data-node-id="' + nodeID + '"] .node-text').evaluate((editor, offsets) => {
+  await selectEditorText(page.locator('[data-node-id="' + nodeID + '"] .node-text'), start, end);
+}
+async function selectEditorText(editorLocator, start, end = start) {
+  await editorLocator.evaluate((editor, offsets) => {
     editor.focus();
     const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT), leaves = [];
     let leaf;
@@ -28,6 +31,124 @@ async function selectNodeText(page, nodeID, start, end = start) {
     range.setStart(...point(offsets.start)); range.setEnd(...point(offsets.end));
     const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
   }, { start, end });
+}
+
+async function framingBoldRegression(context) {
+  const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); page.on('dialog', dialog => dialog.accept());
+  const state = () => page.evaluate(() => window.ReadingFlowApp.getState());
+  const situation = page.getByRole('textbox', { name: '背景', exact: true }), complication = page.getByRole('textbox', { name: '冲突', exact: true });
+  const root = page.locator('[data-node-id="root"] .node-text');
+  const load = async (data, mode) => page.evaluate(async ({ data, mode }) => {
+    const item = { libraryID: 1, key: 'FRAMEB01', title: 'Independent annotation formatting' }, config = window.mockConfig(item, data, mode === 'readOnly');
+    if (mode === 'pending') Object.assign(config, { syncPending: true });
+    if (mode === 'conflict') Object.assign(config, { syncConflict: true });
+    await window.ReadingFlowApp.loadConfig(config);
+  }, { data, mode });
+  try {
+    await page.goto(pathToFileURL(path.join(project, 'content', 'app.xhtml')).href);
+    await page.waitForFunction(() => window.ReadingFlowApp && window.ReadingFlowApp.getState());
+    await load(null);
+    await page.locator('#pyramid-toggle').click(); await root.fill('独立主题保持普通文字');
+    await page.locator('#framing-toggle').click();
+    await situation.fill('前言 alpha beta 结尾😀'); await complication.fill('原因 gamma delta 未知');
+    await selectEditorText(situation, 3, 8); await page.locator('#node-bold').click();
+    assert.deepEqual((await state()).framing.situationBoldRanges, [{ start: 3, end: 8 }]);
+    assert.equal(await page.evaluate(() => window.getSelection().toString()), 'alpha');
+    assert.equal(await page.locator('#node-bold').getAttribute('aria-pressed'), 'true');
+    assert.equal(await situation.locator('b,strong').textContent(), 'alpha');
+    await page.locator('#node-bold').click();
+    assert.deepEqual((await state()).framing.situationBoldRanges || [], []);
+    await page.keyboard.press('Control+b');
+    assert.deepEqual((await state()).framing.situationBoldRanges, [{ start: 3, end: 8 }]);
+    await selectEditorText(complication, 3, 8); await page.keyboard.press('Control+b');
+    assert.deepEqual((await state()).framing.complicationBoldRanges, [{ start: 3, end: 8 }]);
+    await page.keyboard.press('Control+b');
+    assert.deepEqual((await state()).framing.complicationBoldRanges || [], []);
+    await page.keyboard.press('Control+b');
+    assert.deepEqual((await state()).framing.situationBoldRanges, [{ start: 3, end: 8 }]);
+    assert.deepEqual((await state()).pyramid.boldRanges || [], []);
+    pass('background and conflict support selected-text B and Ctrl+B independently without formatting the root');
+
+    await selectEditorText(situation, 5); await page.keyboard.insertText('X');
+    assert.equal((await state()).framing.situation, '前言 alXpha beta 结尾😀');
+    assert.deepEqual((await state()).framing.situationBoldRanges, [{ start: 3, end: 9 }]);
+    await selectEditorText(situation, 5, 6); await page.keyboard.press('Backspace');
+    assert.deepEqual((await state()).framing.situationBoldRanges, [{ start: 3, end: 8 }]);
+    await selectEditorText(situation, 5); await page.keyboard.press('Enter');
+    assert.equal((await state()).framing.situation, '前言 al\npha beta 结尾😀');
+    assert.equal(await page.evaluate(() => { const f = window.ReadingFlowApp.getState().framing; return window.ReadingFlowCore.getTextRuns(f.situation, f.situationBoldRanges).filter(run => run.bold).map(run => run.text).join('').replace(/\n/g, ''); }), 'alpha');
+    assert.equal((await state()).framing.complication, '原因 gamma delta 未知');
+    assert.deepEqual((await state()).framing.complicationBoldRanges, [{ start: 3, end: 8 }]);
+    pass('editing and line breaks inside bold background text preserve UTF-16 ranges without leaking into conflict');
+
+    const beforeCross = await state();
+    for (const target of ['#framing-complication', '[data-node-id="root"] .node-text']) {
+      await situation.evaluate((editor, target) => {
+        editor.focus(); const other = document.querySelector(target);
+        const text = element => document.createTreeWalker(element, NodeFilter.SHOW_TEXT).nextNode();
+        const range = document.createRange(); range.setStart(text(editor), 0); range.setEnd(text(other), 2);
+        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      }, target);
+      await page.locator('#node-bold').evaluate(button => button.click());
+      await page.keyboard.press('Control+b');
+      assert.deepEqual((await state()).framing, beforeCross.framing);
+      assert.deepEqual((await state()).pyramid, beforeCross.pyramid);
+    }
+    pass('selections spanning background, conflict or a pyramid node cannot format multiple editors');
+
+    const formatted = (await state()).framing;
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    assert.deepEqual(await page.evaluate(() => window.__savedState.framing), formatted);
+    await page.locator('#more-toggle').click(); await page.locator('#backup-export').click();
+    await page.waitForFunction(() => window.__backup && window.__backup.item.key === 'FRAMEB01');
+    assert.deepEqual(await page.evaluate(() => window.__backup.framing), formatted);
+    await situation.fill('临时替换文字');
+    await page.evaluate(() => { window.__import = JSON.parse(JSON.stringify(window.__backup)); });
+    await page.locator('#backup-import').click();
+    await page.waitForFunction(text => window.ReadingFlowApp.getState().framing.situation === text && !document.getElementById('backup-import').disabled, formatted.situation);
+    assert.deepEqual((await state()).framing, formatted);
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    await page.reload(); await page.waitForFunction(() => window.ReadingFlowApp && window.ReadingFlowApp.getState());
+    await page.evaluate(async () => { const item = { libraryID: 1, key: 'FRAMEB01', title: 'Independent annotation formatting' }; await window.ReadingFlowApp.loadConfig(window.mockConfig(item, JSON.parse(localStorage.getItem('rf-tools-test-' + item.key)))); });
+    await page.locator('#pyramid-toggle').click();
+    assert.deepEqual((await state()).framing, formatted);
+    assert.equal(await situation.textContent(), formatted.situation);
+    assert.equal(await complication.locator('b,strong').textContent(), 'gamma');
+    const svg = await page.evaluate(() => {
+      const document = new DOMParser().parseFromString(window.ReadingFlowCore.renderPyramidSVG(window.ReadingFlowApp.getState()), 'image/svg+xml');
+      return { annotationBold: [...document.querySelectorAll('[data-role="framing-annotation"] tspan[font-weight="700"]')].map(span => span.textContent).join(''), rootBold: [...document.querySelectorAll('svg > text tspan[font-weight="700"]')].map(span => span.textContent).join('') };
+    });
+    assert.equal(svg.annotationBold, 'alphagamma'); assert.equal(svg.rootBold, '');
+    await page.locator('#insert-pyramid').click(); await page.waitForFunction(() => window.__inserted.length === 1);
+    assert.match(await page.evaluate(() => window.__inserted[0].pngDataURL), /^data:image\/png;base64,/);
+    await page.screenshot({ path: path.join(output, screenshotName('v2-framing-bold')) });
+    pass('annotation formatting survives autosave, JSON import/export, reload and SVG/PNG export');
+
+    const saved = await state();
+    for (const mode of ['readOnly', 'pending', 'conflict']) {
+      await load(saved, mode);
+      assert.equal(await situation.getAttribute('contenteditable'), 'false');
+      assert.equal(await complication.getAttribute('aria-disabled'), 'true');
+      const before = await state();
+      await selectEditorText(situation, 3, 5); await page.keyboard.press('Control+b');
+      await page.locator('#node-bold').evaluate(button => button.click());
+      await situation.evaluate(editor => { editor.textContent = '不得保存的输入'; editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '不得保存的输入' })); });
+      assert.deepEqual((await state()).framing, before.framing);
+      assert.deepEqual((await state()).pyramid, before.pyramid);
+    }
+    await load(saved);
+    await root.fill('独立主题保持普通文字。');
+    await selectEditorText(complication, 3, 8);
+    await page.evaluate(() => { window.__holdSave = true; });
+    await page.locator('#insert-pyramid').click(); await page.waitForFunction(() => window.__saveBlocked);
+    assert.equal(await page.locator('#node-bold').isDisabled(), true);
+    await selectEditorText(complication, 3, 8); await page.keyboard.press('Control+b');
+    await page.locator('#node-bold').evaluate(button => button.click());
+    assert.deepEqual((await state()).framing, saved.framing);
+    await page.evaluate(() => { window.__holdSave = false; window.__releaseSave(); });
+    await page.waitForFunction(() => !document.getElementById('insert-pyramid').disabled);
+    pass('read-only and synchronization guards reject annotation writes and busy actions cannot toggle bold');
+  } finally { await page.close(); }
 }
 
 async function boldEditingRegression(context) {
@@ -599,8 +720,8 @@ async function manualHeightRegression(browser) {
       return note.left >= viewport.left - 1 && note.right <= viewport.right + 1;
     });
     assert.equal(await page.locator('.root-wrap > .node > .node-text').count(), 1);
-    assert.equal(await page.locator('#framing-situation').evaluate(input => input.value), situation);
-    assert.equal(await page.locator('#framing-complication').evaluate(input => input.value), complication);
+    assert.equal(await page.locator('#framing-situation').textContent(), situation);
+    assert.equal(await page.locator('#framing-complication').textContent(), complication);
     pass('background toggle reveals the annotation in a horizontally scrolled 430px tree');
 
     await page.locator('#insert-pyramid').click();
@@ -622,8 +743,8 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.getByRole('textbox', { name: '疑问／回答', exact: true }).textContent(), mergedRoot);
     assert.equal(await page.locator('[data-node-id="root"] .node-text').count(), 1);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().framing.question), '');
-    assert.equal(await page.locator('#framing-situation').evaluate(input => input.value), situation);
-    assert.equal(await page.locator('#framing-complication').evaluate(input => input.value), complication);
+    assert.equal(await page.locator('#framing-situation').textContent(), situation);
+    assert.equal(await page.locator('#framing-complication').textContent(), complication);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().framing.situation), situation);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().framing.complication), complication);
     pass('autosaved tools reload with the complete pyramid and six-step inspection state');
@@ -659,8 +780,8 @@ async function manualHeightRegression(browser) {
     await page.locator('#pyramid-font-size').evaluate(select => { select.value = '32'; select.dispatchEvent(new Event('change', { bubbles: true })); });
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramidFontSize), readOnlySize);
     assert.equal(await page.locator('#pyramid-font-size').evaluate(select => select.value), String(readOnlySize));
-    assert.equal(await page.locator('#framing-situation').isDisabled(), true);
-    assert.equal(await page.locator('#framing-complication').isDisabled(), true);
+    assert.equal(await page.locator('#framing-situation').getAttribute('aria-disabled'), 'true');
+    assert.equal(await page.locator('#framing-complication').getAttribute('aria-disabled'), 'true');
     assert.equal(await page.locator('#node-child').isDisabled(), true);
     assert.equal(await page.locator('#insert-pyramid').isDisabled(), true);
     assert.equal(await page.locator('#backup-import').isDisabled(), true);
@@ -759,6 +880,7 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramid.text), '电脑 B 保留的观点');
     pass('incomplete synchronized data preserves the current tree and prevents premature writes');
     await boldEditingRegression(context);
+    await framingBoldRegression(context);
     await fontSizingRegression(context);
     await resizingIframeRegression(browser);
     await manualHeightRegression(browser);

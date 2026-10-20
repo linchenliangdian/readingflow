@@ -111,6 +111,9 @@ async function runSmokeTest() {
     return handle;
   }
   function occurrences(content, value) { return content.split(value).length - 1; }
+  function hasFramingBold(framing, field, value) {
+    return (framing[field + "BoldRanges"] || []).some(range => framing[field].slice(range.start, range.end) === value);
+  }
   async function verifyBranding(addon, handle, host) {
     const { AddonManager } = ChromeUtils.importESModule("resource://gre/modules/AddonManager.sys.mjs");
     const preferred = AddonManager.getPreferredIconURL(addon, 32, host);
@@ -178,17 +181,42 @@ async function runSmokeTest() {
     check("native pyramid has separate background annotation", !!annotation && document.querySelectorAll(".root-wrap > .node > .node-text").length === 1);
     if (annotation.hidden) document.getElementById("framing-toggle").click();
     const situation = document.getElementById("framing-situation"), complication = document.getElementById("framing-complication");
-    check("native annotations restore legacy background and complication", situation.value === legacy.framing.situation && complication.value === legacy.framing.complication);
-    const beforeRoot = handle.getState().pyramid.text;
-    situation.value += "\n实机背景批注"; situation.dispatchEvent(new handle.toolsWindow.Event("input", { bubbles: true }));
-    complication.value += "\n实机冲突批注"; complication.dispatchEvent(new handle.toolsWindow.Event("input", { bubbles: true }));
+    check("native annotations restore legacy background and complication", situation.textContent === legacy.framing.situation && complication.textContent === legacy.framing.complication);
+    check("native annotations expose the same plain rich-text editors as pyramid nodes", [situation, complication].every(editor => editor.classList.contains("node-text") && editor.getAttribute("contenteditable") === "true"));
+    const beforeRoot = handle.getState().pyramid.text, beforeRootBold = JSON.stringify(handle.getState().pyramid.boldRanges);
+    situation.textContent += "\n实机背景批注"; situation.dispatchEvent(new handle.toolsWindow.Event("input", { bubbles: true }));
+    complication.textContent += "\n实机冲突批注"; complication.dispatchEvent(new handle.toolsWindow.Event("input", { bubbles: true }));
     await handle.toolsWindow.ReadingFlowApp.flushPendingSave();
-    check("native annotation edits preserve the single core field", handle.getState().pyramid.text === beforeRoot && handle.getState().framing.situation === situation.value && handle.getState().framing.complication === complication.value);
+    check("native annotation edits preserve the single core field", handle.getState().pyramid.text === beforeRoot && handle.getState().framing.situation === situation.textContent && handle.getState().framing.complication === complication.textContent);
+    const boldButton = document.getElementById("node-bold");
+    for (const [field, editor, boldText, keyboard] of [["situation", situation, "背景批注", false], ["complication", complication, "冲突批注", true]]) {
+      const original = editor.textContent, start = original.indexOf(boldText), end = start + boldText.length;
+      editor.focus();
+      const range = document.createRange(); range.setStart(editor.firstChild, start); range.setEnd(editor.firstChild, end);
+      const selection = handle.toolsWindow.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      await waitFor(() => !boldButton.disabled && boldButton.getAttribute("aria-pressed") === "false", "native " + field + " bold selection");
+      if (keyboard) editor.dispatchEvent(new handle.toolsWindow.KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+      else boldButton.click();
+      check("native " + field + " selected substring supports " + (keyboard ? "Ctrl+B" : "B toolbar"), editor.textContent === original && handle.getState().framing[field] === original && hasFramingBold(handle.getState().framing, field, boldText) && editor.querySelector("strong,b")?.textContent === boldText && selection.toString() === boldText);
+    }
+    await handle.toolsWindow.ReadingFlowApp.flushPendingSave();
+    check("native annotation bold leaves root text and formatting unchanged", handle.getState().pyramid.text === beforeRoot && JSON.stringify(handle.getState().pyramid.boldRanges) === beforeRootBold);
+    const cachePath = PathUtils.join(expectedData, "reading-flow", handle.item.libraryID + "-" + handle.item.key + ".json");
+    const cached = JSON.parse(await IOUtils.readUTF8(cachePath));
+    check("native background and complication formatting save with their original plain strings", hasFramingBold(cached.framing, "situation", "背景批注") && hasFramingBold(cached.framing, "complication", "冲突批注") && cached.framing.situation === situation.textContent && cached.framing.complication === complication.textContent);
+    result.framingBold = { libraryID: handle.item.libraryID, ownerKey: handle.item.key, situation: "背景批注", complication: "冲突批注" };
     const rootBox = document.querySelector(".root-wrap > .node").getBoundingClientRect(), annotationBox = annotation.getBoundingClientRect();
     check("native annotation and core box do not overlap", rootBox.width > 0 && annotationBox.width > 0 && (annotationBox.right <= rootBox.left || rootBox.right <= annotationBox.left || annotationBox.bottom <= rootBox.top || rootBox.bottom <= annotationBox.top));
     const svg = new handle.toolsWindow.DOMParser().parseFromString(Core.renderPyramidSVG(handle.getState()), "image/svg+xml");
     const annotationText = svg.querySelector('[data-role="framing-annotation"]')?.textContent || "";
     check("native PNG source includes background and complication", annotationText.includes("实机背景批注") && annotationText.includes("实机冲突批注"), annotationText);
+    const boldAnnotationText = Array.from(svg.querySelectorAll('[data-role="framing-annotation"] tspan[font-weight="700"],[data-role="framing-annotation"] tspan[font-weight="bold"]')).map(span => span.textContent).join("");
+    check("native PNG source retains background and complication partial bold", boldAnnotationText.includes("背景批注") && boldAnnotationText.includes("冲突批注"), boldAnnotationText);
+    check("native note HTML exports retain annotation partial bold", [Core.renderStarterNoteHTML(handle.getState()), Core.renderNoteHTML(handle.getState())].every(html => {
+      const exported = new handle.toolsWindow.DOMParser().parseFromString(html, "text/html");
+      const boldText = Array.from(exported.querySelectorAll("strong,b")).map(span => span.textContent).join("");
+      return boldText.includes("背景批注") && boldText.includes("冲突批注");
+    }));
     const scroll = document.getElementById("diagram-scroll");
     scroll.scrollLeft = scroll.scrollWidth;
     document.getElementById("framing-toggle").click();
@@ -198,7 +226,7 @@ async function runSmokeTest() {
       const note = document.querySelector(".framing-note").getBoundingClientRect(), viewport = scroll.getBoundingClientRect();
       return note.left >= viewport.left - 1 && note.right <= viewport.right + 1;
     }, "native background annotation revealed after horizontal scrolling");
-    check("native background toggle brings annotations into view", document.querySelectorAll(".root-wrap > .node > .node-text").length === 1 && document.getElementById("framing-situation").value.includes("实机背景批注") && document.getElementById("framing-complication").value.includes("实机冲突批注"));
+    check("native background toggle brings annotations into view", document.querySelectorAll(".root-wrap > .node > .node-text").length === 1 && document.getElementById("framing-situation").textContent.includes("实机背景批注") && document.getElementById("framing-complication").textContent.includes("实机冲突批注"));
     if (capturePreviews) result.framingPreviewPath = await captureNativeWindow(handle.hostWindow, "native-framing-preview.png");
     if (wasHidden) setDisclosure(handle, "pyramid-area", "pyramid-toggle", false);
   }
@@ -211,7 +239,7 @@ async function runSmokeTest() {
     const after = handle.getState();
     check("native font size updates the saved session", after.pyramidFontSize === 24 && control.value === "24");
     check("native font size preserves text, bold and framing", JSON.stringify(after.pyramid) === JSON.stringify(before.pyramid) && JSON.stringify(after.framing) === JSON.stringify(before.framing));
-    check("native node and annotation text use the selected font size", Array.from(document.querySelectorAll(".node-text,.framing-field textarea")).every(editor => window.getComputedStyle(editor).fontSize === "24px"));
+    check("native node and annotation text use the selected font size", Array.from(document.querySelectorAll(".node-text")).every(editor => window.getComputedStyle(editor).fontSize === "24px"));
     const svg = new window.DOMParser().parseFromString(window.ReadingFlowCore.renderPyramidSVG(after), "image/svg+xml");
     check("native image source uses selected font size including annotation", Array.from(svg.querySelectorAll("text")).every(node => node.getAttribute("font-size") === "24") && !!svg.querySelector('[data-role="framing-annotation"] text'));
     const cachePath = PathUtils.join(expectedData, "reading-flow", after.item.libraryID + "-" + after.item.key + ".json");
@@ -285,7 +313,7 @@ async function runSmokeTest() {
     check("standalone pyramid accepts partial bold", current.getState().pyramid.text === rootText && (current.getState().pyramid.boldRanges || []).some(span => span.start === start && span.end === end));
     if (!document.querySelector(".framing-note") || document.querySelector(".framing-note").hidden) document.getElementById("framing-toggle").click();
     for (const [id, value] of [["framing-situation", "独立背景 A：日常想法整理。"], ["framing-complication", "独立冲突 A：需要厘清论证。"]]) {
-      const field = document.getElementById(id); field.value = value; field.dispatchEvent(new current.toolsWindow.Event("input", { bubbles: true }));
+      const field = document.getElementById(id); field.textContent = value; field.dispatchEvent(new current.toolsWindow.Event("input", { bubbles: true }));
     }
     document.querySelector('.node[data-node-id="root"]').click(); document.getElementById("node-child").click();
     const child = document.querySelector('.top-children .node .node-text');
@@ -372,7 +400,7 @@ async function runSmokeTest() {
     root.textContent = rootText; root.dispatchEvent(new current.toolsWindow.Event("input", { bubbles: true }));
     if (!document.querySelector(".framing-note") || document.querySelector(".framing-note").hidden) document.getElementById("framing-toggle").click();
     const background = document.getElementById("framing-situation");
-    background.value = "PDF 旁的独立背景记录。"; background.dispatchEvent(new current.toolsWindow.Event("input", { bubbles: true }));
+    background.textContent = "PDF 旁的独立背景记录。"; background.dispatchEvent(new current.toolsWindow.Event("input", { bubbles: true }));
     document.getElementById("start-inspection").click();
     await waitFor(() => current.getState().timers.inspection.status === "running", "PDF standalone inspection timer");
     const inspectionDeadline = current.getState().timers.inspection.deadline;
@@ -777,6 +805,7 @@ async function runSmokeTest() {
     check("single root persists after item switch", current.getState().pyramid.text.includes("单框实机编辑内容") && current.toolsWindow.document.querySelectorAll('.node[data-node-id="root"] .node-text').length === 1 && current.getState().framing.question === "");
     check("pyramid bold survives item switch", (current.getState().pyramid.boldRanges || []).some(range => current.getState().pyramid.text.slice(range.start, range.end) === "单框实机编辑内容"));
     check("background annotations survive item switch", current.getState().framing.situation.includes("实机背景批注") && current.getState().framing.complication.includes("实机冲突批注"));
+    check("background and complication partial bold survives item switch and editor reopening", hasFramingBold(current.getState().framing, "situation", "背景批注") && hasFramingBold(current.getState().framing, "complication", "冲突批注") && ["situation", "complication"].every(field => current.toolsWindow.document.getElementById("framing-" + field).querySelector("strong,b")?.textContent === result.framingBold[field]));
     check("manual viewport preference survives returning to first note", current.toolsWindow.ReadingFlowApp.getSizing().manualHeight === heightBeforeSwitch && storedPyramidHeight() === heightBeforeSwitch);
 
     await standaloneNotesRegression(api, host, first, beforeWindows);
@@ -857,6 +886,7 @@ async function runSmokeTest() {
     check("sidebar session persisted", saved.item.key === first.key && saved.noteKey === current.note.key);
     check("pyramid bold range persisted in isolated session", (saved.pyramid.boldRanges || []).some(range => saved.pyramid.text.slice(range.start, range.end) === "单框实机编辑内容"));
     check("background annotations persisted in isolated session", saved.framing.situation.includes("实机背景批注") && saved.framing.complication.includes("实机冲突批注"));
+    check("background and complication partial bold persisted in isolated session", hasFramingBold(saved.framing, "situation", "背景批注") && hasFramingBold(saved.framing, "complication", "冲突批注"));
     check("atomic session temp removed", !(await IOUtils.exists(path + ".tmp")));
     if (capturePreviews) {
       current.toolsWindow.document.getElementById("pyramid-toggle").click();
