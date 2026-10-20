@@ -1,4 +1,5 @@
-/* Editable reading data travels as ordinary Zotero notes, independently of file sync. */
+/* Editable reading data travels as centrally stored JSON attachments. V1 notes
+ * remain readable until every complete version has a verified uploaded copy. */
 (function (root, factory) {
   const api = factory();
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -88,8 +89,12 @@
     if (value.item) { delete value.item.libraryID; delete value.item.title; }
     return checksum(JSON.stringify(value));
   }
-  function create({ Zotero, core }) {
-    if (!Zotero || !core) throw new Error("Reading flow sync requires Zotero and core.");
+  function create({ Zotero, core, fileStore }) {
+    if (!Zotero || !core || !fileStore || !validID(fileStore.writerID) ||
+        !["read", "write", "uploaded"].every(name => typeof fileStore[name] === "function")) {
+      throw new Error("Reading flow sync requires Zotero, core, and its file store.");
+    }
+    let maintenancePromise = null;
     function randomID() {
       if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
       return "d-" + Date.now().toString(36) + "-" + Zotero.Utilities.randomString(24);
@@ -124,7 +129,7 @@
       const portable = clone(raw); portable.item.libraryID = item.libraryID;
       return core.normalizeSession(portable, item);
     }
-    async function discover(context) {
+    async function discoverLegacy(context) {
       const search = new Zotero.Search(); search.libraryID = context.item.libraryID;
       search.addCondition("itemType", "is", "note"); search.addCondition("deleted", "false");
       search.addCondition("note", "contains", FORMAT); search.addCondition("note", "contains", "OWNER:" + context.item.key);
@@ -133,7 +138,7 @@
       for (const id of ids) {
         const note = await Zotero.Items.getAsync(id);
         if (!positioned(note, context)) continue;
-        const value = await noteEnvelope(note);
+        const value = await noteEnvelope(note), originalHTML = note.getNote();
         if (!value) {
           if (note.getNote().includes("OWNER:" + context.item.key)) broken.push(note.key);
           continue;
@@ -147,7 +152,7 @@
           const clock = normalizeClock(value.clock);
           if (!clock[value.deviceID] || typeof value.hash !== "string" || !Number.isSafeInteger(value.length) || value.length < 1 ||
             value.length > Math.ceil(MAX_BYTES / 3) * 4 + 4) throw new Error("invalid head");
-          const pieces = [];
+          const pieces = [], partNotes = [], snapshots = [{ id: note.id, key: note.key, html: originalHTML }];
           if (typeof value.data === "string" && value.data.length <= PART_SIZE && !value.partKeys) pieces.push(value.data);
           else {
             if (!Array.isArray(value.partKeys) || !value.partKeys.length || value.partKeys.length > 200 ||
@@ -159,17 +164,46 @@
               if (!owned(part, context) || part.kind !== "part" || part.deviceID !== value.deviceID || part.revision !== value.revision ||
                 part.index !== index || part.count !== value.partKeys.length || typeof part.data !== "string" || part.data.length > PART_SIZE) throw new Error("invalid part");
               pieces.push(part.data);
+              partNotes.push(partNote);
+              snapshots.push({ id: partNote.id, key: partNote.key, html: partNote.getNote() });
             }
           }
           const payload = pieces.join("");
           if (payload.length !== value.length || checksum(payload) !== value.hash) throw new Error("incomplete payload");
           const state = normalizeRemote(decodePayload(payload), context.item);
-          heads.push({ id: value.revision, key: note.key, note, envelope: value, clock, state, hash: stateHash(state), payloadHash: value.hash, deviceID: value.deviceID });
+          heads.push({ id: value.revision, key: note.key, note, parts: partNotes, snapshots, envelope: value, clock, state,
+            hash: stateHash(state), payloadHash: value.hash, deviceID: value.deviceID, legacy: true });
         }
         catch (_) { broken.push(note.key); }
       }
-      const fingerprint = heads.map(head => head.key + ":" + head.id + ":" + head.payloadHash).concat(broken.map(key => key + ":pending")).sort().join("|");
+      const fingerprint = heads.map(head => head.key + ":" + head.id + ":" + checksum(JSON.stringify(head.envelope)) + ":" +
+        head.snapshots.map(value => value.key + ":" + checksum(value.html)).join(","))
+        .concat(broken.map(key => key + ":pending")).sort().join("|");
       return { heads, broken, fingerprint };
+    }
+    function recordFor(head, context) {
+      return { format: FORMAT, kind: "head", ownerKey: context.item.key, ownerKind: context.ownerKind,
+        deviceID: head.deviceID, revision: head.id, clock: clone(head.clock), state: clone(head.state), hash: head.hash };
+    }
+    async function discover(context) {
+      const legacy = await discoverLegacy(context), files = await fileStore.read(context.item.libraryID);
+      const heads = legacy.heads.slice(), broken = legacy.broken.slice();
+      for (const value of files.pending || []) broken.push("file:" + value.key);
+      for (const { record, sourceKey } of files.records || []) {
+        if (!record || record.ownerKey !== context.item.key || record.ownerKind !== context.ownerKind) continue;
+        try {
+          if (!owned(record, context) || record.kind !== "head") throw new Error("invalid file record");
+          const clock = normalizeClock(record.clock), state = normalizeRemote(record.state, context.item);
+          if (!clock[record.deviceID] || stateHash(state) !== record.hash) throw new Error("invalid file state");
+          heads.push({ id: record.revision, key: "file:" + sourceKey + ":" + record.revision,
+            envelope: record, clock, state, hash: record.hash, payloadHash: record.hash,
+            deviceID: record.deviceID, legacy: false, sourceKey });
+        }
+        catch (_) { broken.push("file:" + sourceKey + ":" + record.revision); }
+      }
+      const fingerprint = heads.map(head => head.key + ":" + head.id + ":" + head.payloadHash)
+        .concat(broken.map(key => key + ":pending")).sort().join("|");
+      return { heads, broken, fingerprint, legacy };
     }
     function maxima(heads) {
       return heads.filter(head => !heads.some(other => other !== head && dominates(other.clock, head.clock) && !sameClock(other.clock, head.clock)));
@@ -213,9 +247,9 @@
         }
       }
       const pending = found.broken.length > 0;
-      if (pending && !selected) throw new Error("金字塔同步数据尚未到齐或已损坏，未打开空白金字塔；请先完成 Zotero 同步后重试。");
+      if (pending && !selected) throw new Error("金字塔同步数据尚未到齐或已损坏，未打开空白金字塔；请先完成 Zotero 数据和文件同步后重试。");
       const state = selected ? clone(selected.state) : core.createSession(item);
-      const notice = pending ? "部分金字塔同步数据尚未到齐或已损坏，已保留现有版本；请完成 Zotero 同步后重新打开。" :
+      const notice = pending ? "部分金字塔同步数据尚未到齐或已损坏，已保留现有版本；请完成 Zotero 数据和文件同步后重新打开。" :
         conflict ? "检测到不同设备的金字塔版本；各版本均已保留，请选择要继续使用的版本。" : "";
       return { state, token: makeToken(context, found, selected, conflict, pending), versions, conflict, pending,
         hasRemote: found.heads.length > 0 || pending, needsPublish, notice };
@@ -225,49 +259,122 @@
       if (!library || !library.editable) throw new Error("此文献库为只读，金字塔本机草稿已保留。");
       if (!token || token.ownerKey !== item.key || token.libraryID !== item.libraryID) throw new Error("金字塔同步关联已改变，请重新打开阅读台。");
       const found = await discover(context);
-      if (found.broken.length) throw new Error("金字塔同步数据尚未完整，已保留本机草稿；请完成 Zotero 同步后重试。");
+      if (found.broken.length) throw new Error("金字塔同步数据尚未完整，已保留本机草稿；请完成 Zotero 数据和文件同步后重试。");
       if (token.fingerprint !== found.fingerprint) throw new Error("另一设备的金字塔版本已到达，本机草稿已保留；请重新打开后选择版本。");
       if (!resolve && (token.conflict || token.pending || uniqueMaxima(found.heads).length > 1)) throw new Error("金字塔存在多个版本；请先选择版本，本机草稿已保留。");
       const state = core.normalizeSession(rawState, item), hash = stateHash(state);
+      encodePayload(state); // Keep the established per-session 16 MB safety bound.
       if (!resolve && found.heads.length) {
         const latest = uniqueMaxima(found.heads);
         if (latest.length === 1 && latest[0].hash === hash) {
           const current = latest[0];
-          return { token: makeToken(context, found, current, false, false),
+          if (found.legacy.heads.length) await fileStore.write(item.libraryID,
+            found.legacy.heads.map(head => recordFor(head, context)), { replaceOwnCurrent: false });
+          const refreshed = found.legacy.heads.length ? await discover(context) : found;
+          return { token: makeToken(context, refreshed, current, false, refreshed.broken.length > 0),
             cacheMeta: { format: FORMAT, ownerKey: item.key, clock: clone(current.clock), stateHash: hash, revision: current.id, pending: false },
-            message: "已保存，随 Zotero 笔记同步" };
+            message: "已保存，随 Zotero 文件同步" };
         }
       }
-      const id = deviceID(), revision = randomID();
+      // The lease, unlike a copied preference, cannot make two offline devices
+      // increment the same vector-clock component or overwrite the same file.
+      const id = fileStore.writerID, revision = randomID();
       const clock = mergeClocks(resolve ? found.heads.map(head => head.clock).concat([token.clock || {}]) : [token.clock || {}]);
       clock[id] = (clock[id] || 0) + 1;
-      const encoded = splitPayload(state), own = maxima(found.heads.filter(head => head.deviceID === id));
-      // An unexpected duplicate device head can be a restored/cloned profile. Never overwrite it.
-      // Explicit conflict resolution writes a fresh head so every conflicting original stays recoverable.
-      const existing = !resolve && own.length === 1 ? own[0].note : null;
-      const writtenParts = [], envelopeBase = { format: FORMAT, ownerKey: item.key, ownerKind: context.ownerKind, deviceID: id, revision };
-      let headNote;
-      await Zotero.DB.executeTransaction(async () => {
-        for (let index = 0; encoded.parts.length > 1 && index < encoded.parts.length; index++) {
-          const note = new Zotero.Item("note"); note.libraryID = item.libraryID;
-          if (context.parentID !== null) note.parentID = context.parentID;
-          note.setNote(encodeNote({ ...envelopeBase, kind: "part", index, count: encoded.parts.length, data: encoded.parts[index] }));
-          note.addTag(TAG); await note.save(); writtenParts.push(note);
-        }
-        headNote = existing || new Zotero.Item("note"); headNote.libraryID = item.libraryID;
-        if (context.parentID !== null) headNote.parentID = context.parentID;
-        const body = encoded.parts.length === 1 ? { data: encoded.parts[0] } : { partKeys: writtenParts.map(note => note.key) };
-        headNote.setNote(encodeNote({ ...envelopeBase, kind: "head", clock, ...body, hash: encoded.hash, length: encoded.length }));
-        headNote.addTag(TAG); await headNote.save();
-      });
-      // Old immutable part notes stay recoverable and are never removed during a save.
-      const nextHeads = found.heads.filter(head => head.key !== headNote.key).concat([{ key: headNote.key, id: revision, payloadHash: encoded.hash }]);
-      const fingerprint = nextHeads.map(head => head.key + ":" + head.id + ":" + head.payloadHash).sort().join("|");
-      const nextToken = { ownerKey: item.key, libraryID: item.libraryID, fingerprint, signature: fingerprint, clock: clone(clock), selected: revision, conflict: false, pending: false };
+      const record = { format: FORMAT, kind: "head", ownerKey: item.key, ownerKind: context.ownerKind,
+        deviceID: id, revision, clock, state, hash };
+      const preserved = found.legacy.heads.map(head => recordFor(head, context));
+      await fileStore.write(item.libraryID, preserved.concat([record]), { replaceOwnCurrent: !resolve });
+      const refreshed = await discover(context), pending = refreshed.broken.length > 0;
+      const nextToken = { ownerKey: item.key, libraryID: item.libraryID, fingerprint: refreshed.fingerprint,
+        signature: refreshed.fingerprint, clock: clone(clock), selected: revision, conflict: false, pending };
       const cacheMeta = { format: FORMAT, ownerKey: item.key, clock: clone(clock), stateHash: hash, revision, pending: false };
-      return { token: nextToken, cacheMeta, message: "已保存，随 Zotero 笔记同步" };
+      return { token: nextToken, cacheMeta, message: "已保存，随 Zotero 文件同步" };
     }
-    return { load, save };
+    async function performMaintenance() {
+      const result = { migrated: 0, archived: 0, pending: 0 };
+      if (typeof fileStore.consolidate === "function") {
+        for (const library of Zotero.Libraries.getAll()) {
+          if (!library.editable || library.filesEditable === false) continue;
+          try { await fileStore.consolidate(library.libraryID); }
+          catch (error) { result.pending++; if (typeof Zotero.logError === "function") Zotero.logError(error); }
+        }
+      }
+      const search = new Zotero.Search();
+      search.addCondition("itemType", "is", "note"); search.addCondition("deleted", "false");
+      search.addCondition("note", "contains", FORMAT); search.addCondition("note", "contains", "KIND:head");
+      const groups = new Map();
+      for (const id of await search.search()) {
+        const note = await Zotero.Items.getAsync(id);
+        if (!note || note.deleted || !note.isNote()) continue;
+        let value;
+        try { value = await noteEnvelope(note); } catch (_) { result.pending++; continue; }
+        if (!value || value.kind !== "head" || !validID(value.ownerKey) || !["item", "note"].includes(value.ownerKind)) continue;
+        const key = note.libraryID + ":" + value.ownerKind + ":" + value.ownerKey;
+        groups.set(key, { libraryID: note.libraryID, key: value.ownerKey, title: "" });
+      }
+      for (const item of groups.values()) {
+        const library = Zotero.Libraries.get(item.libraryID);
+        if (!library?.editable || library.filesEditable === false) { result.pending++; continue; }
+        try {
+          const context = await ownerContext(item), found = await discoverLegacy(context);
+          if (found.broken.length || !found.heads.length) { result.pending++; continue; }
+          const records = found.heads.map(head => recordFor(head, context));
+          // Reading back a local file is necessary but never sufficient to remove
+          // notes: the storage transport must also acknowledge its uploaded hash.
+          if (!(await fileStore.uploaded(item.libraryID, records))) {
+            await fileStore.write(item.libraryID, records, { replaceOwnCurrent: false });
+            result.migrated += records.length;
+          }
+          if (!(await fileStore.uploaded(item.libraryID, records))) { result.pending++; continue; }
+          const fresh = await discoverLegacy(context);
+          if (fresh.broken.length || fresh.fingerprint !== found.fingerprint) { result.pending++; continue; }
+          const managed = [], snapshots = [];
+          for (const head of fresh.heads) {
+            const candidates = [head.note].concat(head.parts || []);
+            // Only exact, well-formed plugin notes are eligible. Tags alone, old
+            // orphan parts, and user prose never authorize deleting anything.
+            if (!candidates.every(note => typeof note.hasTag === "function" ? note.hasTag(TAG) :
+                typeof note.getTags === "function" && note.getTags().some(value => value.tag === TAG))) continue;
+            managed.push(...candidates);
+            snapshots.push(...head.snapshots);
+          }
+          const ids = Array.from(new Set(managed.map(note => note.id)));
+          if (!ids.length) continue;
+          // This is deliberately trash, never erase; original bytes remain in the
+          // native recycle bin even after the JSON data is verified in storage.
+          const archived = await Zotero.DB.executeTransaction(async () => {
+            // Native sync changes are serialized with this transaction. Check
+            // owner placement and exact original note bytes again at its edge;
+            // a late clock edit or appended text must remain recoverable in place.
+            await ownerContext(item);
+            const library = Zotero.Libraries.get(item.libraryID);
+            if (!library?.editable || library.filesEditable === false) return 0;
+            for (const snapshot of snapshots) {
+              const note = Zotero.Items.get(snapshot.id);
+              if (!positioned(note, context) || note.key !== snapshot.key || note.getNote() !== snapshot.html ||
+                  !(typeof note.hasTag === "function" ? note.hasTag(TAG) : note.getTags?.().some(value => value.tag === TAG))) return 0;
+            }
+            await Zotero.Items.trash(ids);
+            return ids.length;
+          });
+          result.archived += archived;
+        }
+        catch (error) {
+          result.pending++;
+          if (typeof Zotero.logError === "function") Zotero.logError(error);
+        }
+      }
+      return result;
+    }
+    function maintenance() {
+      if (maintenancePromise) return maintenancePromise;
+      maintenancePromise = performMaintenance();
+      const pending = maintenancePromise;
+      pending.finally(() => { if (maintenancePromise === pending) maintenancePromise = null; }).catch(() => {});
+      return pending;
+    }
+    return { load, save, maintenance };
   }
   return { FORMAT, TAG, DEVICE_PREF, MAX_NOTE, MAX_BYTES, PART_SIZE, create, encodeNote, decodeNote, encodePayload, decodePayload, splitPayload,
     checksum, stateHash, normalizeClock, mergeClocks, dominates, sameClock };

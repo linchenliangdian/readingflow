@@ -8,18 +8,20 @@ var ReadingFlowIntegration = (function () {
   const ICON = "chrome://reading-flow/content/icons/pyramid.svg";
   const hosts = new Map(), saveQueues = new Map(), pendingOpens = new Set(), pendingDetaches = new Set(), detachOperations = new Map(), noteQueues = new Map(), activeHandles = new Map(), focusVersions = new Map(), menuIDs = [];
   const unsavedNotes = new WeakMap();
-  const localRecords = new Map();
-  let syncStore = null, migrationPromise = null, syncRefreshTimer = null;
+  const localRecords = new Map(), dataDownloads = new Map();
+  let syncStore = null, fileStore = null, migrationPromise = null, syncRefreshTimer = null;
+  let dataMaintenancePromise = null, dataMaintenanceTimer = null, dataMaintenanceAgain = false;
   let resourceVersion = "";
   let active = false, dataDirectory = null, FilePicker = null, publicAPI = null, registeredPaneID = null, readerHandler = null, notifierID = null, stopPromise = null;
   function sessionKey(item) { return item.libraryID + "-" + item.key; }
   function draftPath(item) { return PathUtils.join(dataDirectory, sessionKey(item) + ".json"); }
   function standaloneNote(item) { return !!(item && !item.deleted && typeof item.isNote === "function" && item.isNote() && !item.parentID); }
   function parentOf(item) {
+    if (fileStore?.isManagedItem(item)) return null;
     if (item && typeof item.isNote === "function" && item.isNote() && typeof item.getNote === "function" && item.getNote().includes("READING_FLOW_SYNC_V1")) return null;
     if (standaloneNote(item)) return item;
     const parent = item && (item.topLevelItem || item);
-    return parent && parent.isRegularItem() && !parent.deleted ? parent : null;
+    return parent && parent.isRegularItem() && !parent.deleted && !fileStore?.isManagedItem(parent) ? parent : null;
   }
   function identity(parent) {
     const note = typeof parent.isNote === "function" && parent.isNote();
@@ -85,6 +87,25 @@ var ReadingFlowIntegration = (function () {
   function saveState(item, state) {
     return queueSave(item, () => writeDraft(item, state, localRecords.get(sessionKey(item))?.readingFlowSync));
   }
+  function requestDataDownloads(libraryID) {
+    const store = fileStore;
+    if (!active || !store?.requestDownloads || dataDownloads.has(libraryID)) return;
+    const request = Promise.resolve().then(() => store.requestDownloads(libraryID));
+    dataDownloads.set(libraryID, request);
+    request.then(results => {
+      if (active && fileStore === store && results?.some(result => result.downloaded)) {
+        scheduleDataMaintenance(); scheduleSyncRefresh();
+      }
+    }).catch(error => { if (active && fileStore === store) Zotero.logError(error); })
+      .finally(() => { if (dataDownloads.get(libraryID) === request) dataDownloads.delete(libraryID); });
+  }
+  async function loadSyncedState(item, localRaw) {
+    try {
+      const loaded = await syncStore.load(item, localRaw);
+      if (loaded.pending) requestDataDownloads(item.libraryID);
+      return loaded;
+    } catch (error) { requestDataDownloads(item.libraryID); throw error; }
+  }
   function saveSyncedState(item, state, token, options) {
     return queueSave(item, async () => {
       if (options?.canPublish && !options.canPublish()) return { ignored: true };
@@ -92,7 +113,7 @@ var ReadingFlowIntegration = (function () {
         const busy = () => !active || activeHandles.has(sessionKey(item)) || pendingOpens.size > 0;
         if (busy()) return { ignored: true };
         const raw = await readJSON(draftPath(item)); localRecords.set(sessionKey(item), raw);
-        const fresh = await syncStore.load(item, raw);
+        const fresh = await loadSyncedState(item, raw);
         if (busy() || fresh.conflict || fresh.pending || !fresh.needsPublish && fresh.hasRemote) return { ignored: true };
         state = fresh.state; token = fresh.token;
       }
@@ -618,7 +639,7 @@ var ReadingFlowIntegration = (function () {
       if (parentID === null) { await flushExternalNote(handle, parent); if (!active || generation !== handle.generation) return null; }
       const localState = await initialState(item); if (!active || generation !== handle.generation) return null;
       const localRaw = localRecords.get(key) || null;
-      let synced = await syncStore.load(item, localRaw);
+      let synced = await loadSyncedState(item, localRaw);
       const state = synced.state || localState;
       if (!active || generation !== handle.generation || focusVersions.get(key) !== focusVersion) return null;
       const syncedNoteKey = state.noteKey;
@@ -666,7 +687,7 @@ var ReadingFlowIntegration = (function () {
         exportJSON: value => exportJSON(item, value, handle.hostWindow), importJSON: () => importJSON(item, handle.hostWindow), canEdit: !readOnly && !synced.conflict && !synced.pending,
         async resolveSyncVersion(id) {
           if (readOnly || handle.config !== config || activeHandles.get(key) !== handle) throw new Error("请在当前可编辑的阅读侧栏选择版本。");
-          let fresh = await syncStore.load(item, localRecords.get(key) || null);
+          let fresh = await loadSyncedState(item, localRecords.get(key) || null);
           const version = fresh.versions.find(version => version.id === id);
           if (!version || fresh.pending) throw new Error("同步版本已变化或尚未下载完整，请稍后重新选择。");
           const chosen = snapshot(version.state, item); chosen.noteKey = boundNoteKey || chosen.noteKey;
@@ -676,7 +697,7 @@ var ReadingFlowIntegration = (function () {
             // so explicitly choosing another version cannot erase its only copy.
             const preserved = snapshot(unpublished.state, item); preserved.noteKey = boundNoteKey || preserved.noteKey;
             await saveSyncedState(item, preserved, fresh.token, { resolve: true });
-            fresh = await syncStore.load(item, localRecords.get(key) || null);
+            fresh = await loadSyncedState(item, localRecords.get(key) || null);
           }
           const saved = await saveSyncedState(item, chosen, fresh.token, { resolve: true });
           handle.syncToken = saved.token; handle.syncSignature = saved.token?.signature;
@@ -742,13 +763,13 @@ var ReadingFlowIntegration = (function () {
       const config = handle.config, item = handle.item, key = sessionKey(item);
       try {
         const pending = saveQueues.get(key); if (pending) await pending.catch(() => {});
-        let remote = await syncStore.load(item, localRecords.get(key) || null);
+        let remote = await loadSyncedState(item, localRecords.get(key) || null);
         const bindingArrived = !handle.note && remote.state?.noteKey && await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, remote.state.noteKey);
         if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && !bindingArrived) continue;
         const app = toolsWindow(handle)?.ReadingFlowApp;
         if (app && typeof app.hasPendingChanges === "function" && app.hasPendingChanges()) {
           try { await app.flushPendingSave(); } catch (_) { /* The local draft remains available as a conflict version. */ }
-          remote = await syncStore.load(item, localRecords.get(key) || null);
+          remote = await loadSyncedState(item, localRecords.get(key) || null);
         }
         if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && !bindingArrived) continue;
         const parent = await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, item.key);
@@ -766,6 +787,31 @@ var ReadingFlowIntegration = (function () {
     const window = Zotero.getMainWindow(); if (!window) return;
     syncRefreshTimer = window.setTimeout(() => { syncRefreshTimer = null; refreshSyncedHandles().catch(error => Zotero.logError(error)); }, 250);
   }
+  function maintainDataFiles() {
+    if (!active || !syncStore?.maintenance) return Promise.resolve();
+    if (dataMaintenancePromise) return dataMaintenancePromise;
+    const store = syncStore;
+    const operation = Promise.resolve().then(() => store.maintenance());
+    dataMaintenancePromise = operation;
+    operation.catch(error => Zotero.logError(error)).finally(() => {
+      if (dataMaintenancePromise !== operation) return;
+      dataMaintenancePromise = null;
+      if (active && dataMaintenanceAgain) { dataMaintenanceAgain = false; scheduleDataMaintenance(); }
+    });
+    return operation;
+  }
+  function scheduleDataMaintenance() {
+    if (!active) return;
+    if (dataMaintenancePromise) { dataMaintenanceAgain = true; return; }
+    if (dataMaintenanceTimer !== null) return;
+    const window = Zotero.getMainWindow(); if (!window) return;
+    dataMaintenanceTimer = window.setTimeout(() => {
+      dataMaintenanceTimer = null;
+      Promise.resolve(migrationPromise).catch(() => {}).then(() => {
+        if (active) return maintainDataFiles();
+      }).catch(error => Zotero.logError(error));
+    }, 500);
+  }
   async function migrateLocalDrafts() {
     if (typeof IOUtils.getChildren !== "function" || !(await IOUtils.exists(dataDirectory))) return;
     for (const path of await IOUtils.getChildren(dataDirectory)) {
@@ -777,7 +823,7 @@ var ReadingFlowIntegration = (function () {
         const item = identity(parent), key = sessionKey(item);
         if (activeHandles.has(key) || Array.from(pendingOpens).length) continue;
         await initialState(item);
-        const loaded = await syncStore.load(item, localRecords.get(key) || null);
+        const loaded = await loadSyncedState(item, localRecords.get(key) || null);
         if (!active || activeHandles.has(key) || loaded.pending || loaded.conflict || !loaded.needsPublish && loaded.hasRemote) continue;
         if (loaded.state.noteKey) {
           const note = await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, loaded.state.noteKey);
@@ -792,7 +838,9 @@ var ReadingFlowIntegration = (function () {
     resourceVersion = typeof version === "string" ? version : "";
     if (!Zotero.ItemPaneManager || !Zotero.ItemPaneManager.registerSection) throw new Error("当前 Zotero 缺少所需的侧栏接口。");
     ({ FilePicker } = ChromeUtils.importESModule("chrome://zotero/content/modules/filePicker.mjs")); dataDirectory = PathUtils.join(Zotero.DataDirectory.dir, "reading-flow"); stopPromise = null; active = true;
-    syncStore = ReadingFlowSync.create({ Zotero, core });
+    if (typeof ReadingFlowFileSync === "undefined") throw new Error("Reading flow 数据文件模块未能载入，请重新启用插件。");
+    fileStore = ReadingFlowFileSync.create({ Zotero, IOUtils, PathUtils });
+    syncStore = ReadingFlowSync.create({ Zotero, core, fileStore });
     registeredPaneID = Zotero.ItemPaneManager.registerSection({ paneID: "reading-flow", pluginID: id, header: { l10nID: "sidenav-notes", icon: ICON }, sidenav: { l10nID: "sidenav-notes", icon: ICON, orderable: false },
       onInit({ doc, body }) { attachWindow(doc.defaultView); body.closest("item-pane-custom-section").style.display = "none"; },
       onItemChange({ doc, item, tabType, setEnabled }) {
@@ -817,17 +865,19 @@ var ReadingFlowIntegration = (function () {
     readerHandler = ({ reader }) => { if (!active || !reader || !reader._window) return; const host = attachWindow(reader._window); if (host && reader._window.reader && !reader._window.ZoteroPane) ensureStandalone(host, reader); };
     if (Zotero.Reader) { Zotero.Reader.registerEventListener("renderToolbar", readerHandler, id); for (const reader of Zotero.Reader._readers || []) readerHandler({ reader }); }
     notifierID = Zotero.Notifier.registerObserver({ notify(action, type) {
-      if (type === "item" && ["add", "modify", "delete", "trash", "refresh"].includes(action)) { scheduleSyncRefresh(); return; }
+      if (type === "sync" && action === "finish") { scheduleDataMaintenance(); scheduleSyncRefresh(); return; }
+      if (type === "item" && ["add", "modify", "delete", "trash", "refresh"].includes(action)) { scheduleDataMaintenance(); scheduleSyncRefresh(); return; }
       if (type !== "tab" || !["select", "load"].includes(action)) return;
       for (const host of hosts.values()) { const handle = host.panels.get("reader"); if (!handle || handle.deck.selectedPanel !== handle.panel) continue; const parent = panelParent(handle); if (parent) openInHandle(handle, parent).catch(error => Zotero.logError(error)); }
-    } }, ["tab", "item"], "reading-flow");
+    } }, ["tab", "item", "sync"], "reading-flow");
     registerMenu(id, "main/menubar/tools"); registerMenu(id, "main/library/item"); registerMenu(id, "reader/menubar/file");
     publicAPI = {
       async openItem(itemID, window) { if (!Number.isInteger(itemID) || itemID <= 0) throw new Error("文献编号无效。"); const parent = parentOf(await Zotero.Items.getAsync(itemID)); if (!parent) throw new Error("请从文献条目、它的子附件或独立笔记打开阅读台。"); return open(parent, window); },
       inspect(window) { const host = hosts.get(window || Zotero.getMainWindow()); return host ? Array.from(host.panels.values()) : []; },
+      maintenance() { return maintainDataFiles(); },
       get paneID() { return registeredPaneID; }
     }; Zotero.ReadingFlow = publicAPI;
-    migrationPromise = migrateLocalDrafts().catch(error => Zotero.logError(error));
+    migrationPromise = maintainDataFiles().catch(error => Zotero.logError(error)).then(() => migrateLocalDrafts()).catch(error => Zotero.logError(error));
     if (typeof Zotero.addShutdownListener === "function") {
       const ownedAPI = publicAPI;
       Zotero.addShutdownListener(async () => {
@@ -852,8 +902,11 @@ var ReadingFlowIntegration = (function () {
     return stopPromise;
   }
   async function stopNow() {
+    dataMaintenanceAgain = false;
     if (syncRefreshTimer !== null) { Zotero.getMainWindow()?.clearTimeout(syncRefreshTimer); syncRefreshTimer = null; }
+    if (dataMaintenanceTimer !== null) { Zotero.getMainWindow()?.clearTimeout(dataMaintenanceTimer); dataMaintenanceTimer = null; }
     if (migrationPromise) await migrationPromise; migrationPromise = null;
+    if (dataMaintenancePromise) { try { await dataMaintenancePromise; } catch (_) {} } dataMaintenancePromise = null;
     if (readerHandler && Zotero.Reader) {
       // Zotero 9.0.6's public unregister filter incorrectly keeps matching listeners.
       // Remove just our listener and preserve every other plugin's reader hooks.
@@ -869,7 +922,7 @@ var ReadingFlowIntegration = (function () {
     await Promise.allSettled(Array.from(saveQueues.values()));
     // Plugin API unregister refreshes start SQLite transactions but return boolean.
     if (Zotero.DB && typeof Zotero.DB.waitForTransaction === "function") await Zotero.DB.waitForTransaction();
-    pendingOpens.clear(); saveQueues.clear(); noteQueues.clear(); activeHandles.clear(); focusVersions.clear(); detachOperations.clear(); localRecords.clear(); syncStore = null;
+    pendingOpens.clear(); saveQueues.clear(); noteQueues.clear(); activeHandles.clear(); focusVersions.clear(); detachOperations.clear(); localRecords.clear(); dataDownloads.clear(); syncStore = null; fileStore = null;
   }
   return { start, stop, attachWindow, detachWindow };
 })();

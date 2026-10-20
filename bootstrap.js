@@ -29,6 +29,9 @@ async function startup({ id, version, rootURI }) {
       "chrome://reading-flow/content/sync.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
     );
     Services.scriptloader.loadSubScript(
+      "chrome://reading-flow/content/file-sync.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
+    );
+    Services.scriptloader.loadSubScript(
       "chrome://reading-flow/content/integration.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
     );
     await ReadingFlowIntegration.start({ id, version, rootURI });

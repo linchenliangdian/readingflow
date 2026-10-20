@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from scripts.release import repository_name, update_url
 
 ROOT = Path(__file__).resolve().parent
-FILES = ["manifest.json", "bootstrap.js", "content/integration.js", "content/core.js", "content/sync.js", "content/app.xhtml", "content/app.js", "content/style.css", "content/icons/pyramid.svg", "LICENSE"]
+FILES = ["manifest.json", "bootstrap.js", "content/integration.js", "content/core.js", "content/sync.js", "content/file-sync.js", "content/app.xhtml", "content/app.js", "content/style.css", "content/icons/pyramid.svg", "LICENSE"]
 
 def validate_resource_versions(source, version):
     document = ET.parse(source).getroot()

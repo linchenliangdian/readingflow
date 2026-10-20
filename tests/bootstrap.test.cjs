@@ -71,7 +71,7 @@ test('bootstrap uses supported Components globals, registers chrome and cleans l
   assert.equal(calls[0].uri, args.rootURI + 'manifest.json');
   assert.deepEqual(calls[0].entries, [['content', 'reading-flow', 'content/']]);
   assert.deepEqual(calls.filter(c => c.name === 'script').map(c => c.uri), [
-    'chrome://reading-flow/content/core.js?v=1.0.0', 'chrome://reading-flow/content/sync.js?v=1.0.0', 'chrome://reading-flow/content/integration.js?v=1.0.0'
+    'chrome://reading-flow/content/core.js?v=1.0.0', 'chrome://reading-flow/content/sync.js?v=1.0.0', 'chrome://reading-flow/content/file-sync.js?v=1.0.0', 'chrome://reading-flow/content/integration.js?v=1.0.0'
   ]);
   await scope.shutdown();
   assert.deepEqual(calls.slice(-2).map(c => c.name), ['stop', 'destruct']);
@@ -84,7 +84,7 @@ test('every privileged script has an encoded version key that changes across an 
     const previous = calls.length;
     await scope.startup({ ...args, version });
     const scripts = calls.slice(previous).filter(call => call.name === 'script').map(call => call.uri);
-    assert.deepEqual(scripts, ['core.js', 'sync.js', 'integration.js'].map(name => 'chrome://reading-flow/content/' + name + '?v=' + encodeURIComponent(version)));
+    assert.deepEqual(scripts, ['core.js', 'sync.js', 'file-sync.js', 'integration.js'].map(name => 'chrome://reading-flow/content/' + name + '?v=' + encodeURIComponent(version)));
     requests.push(scripts); await scope.shutdown();
   }
   for (let index = 0; index < requests[0].length; index++) assert.notEqual(requests[0][index], requests[1][index]);

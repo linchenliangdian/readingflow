@@ -7,8 +7,10 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def main(scenario="v2", inspect=False):
-    TEST_ROOT = ROOT / "tmp" / ("zotero-test-sync" if scenario == "sync" else "zotero-test-v2" if scenario in ("v2", "cold") else "zotero-test")
+def main(scenario="v2", inspect=False, test_name=None):
+    if test_name is not None and (not test_name.startswith("zotero-test-") or not all(char.isascii() and (char.isalnum() or char == "-") for char in test_name)):
+        raise ValueError("Test name must be a plain zotero-test-* directory name")
+    TEST_ROOT = ROOT / "tmp" / (test_name or ("zotero-test-sync" if scenario == "sync" else "zotero-test-v2" if scenario in ("v2", "cold") else "zotero-test"))
     settings = json.loads((TEST_ROOT / "test-settings.json").read_text(encoding="utf-8")) if (TEST_ROOT / "test-settings.json").is_file() else {"port": 9223}
     deadline = time.time() + 30
     while True:
@@ -99,5 +101,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("v1", "v2", "cold", "sync"), default="v2")
     parser.add_argument("--inspect", action="store_true", help="Read runtime handles without dispatching a second smoke test")
+    parser.add_argument("--test-name", help="Use a verified project-local disposable test directory")
     args = parser.parse_args()
-    main(args.scenario, args.inspect)
+    main(args.scenario, args.inspect, args.test_name)
