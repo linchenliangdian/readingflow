@@ -196,8 +196,12 @@ var ReadingFlowIntegration = (function () {
       if (recovery) await backupBeforeNoteRelink(item);
       const created = !note;
       if (!note) {
-        note = new Zotero.Item("note"); note.libraryID = item.libraryID; note.parentID = parent.id;
-        note.setNote(core.renderStarterNoteHTML ? core.renderStarterNoteHTML(state) : core.renderNoteHTML(state)); note.addTag("Reading Flow"); note.addTag(SIDEBAR_NOTE_TAG); await note.saveTx();
+        await queueSave(item, () => Zotero.DB.executeTransaction(async () => {
+          note = new Zotero.Item("note"); note.libraryID = item.libraryID; note.parentID = parent.id;
+          note.setNote(core.renderStarterNoteHTML ? core.renderStarterNoteHTML(state) : core.renderNoteHTML(state)); await note.save();
+          state.noteKey = note.key;
+          await writeDraft(item, state, localRecords.get(key)?.readingFlowSync);
+        }));
       }
       if (state.noteKey !== note.key) { state.noteKey = note.key; await saveState(item, state); }
       const notice = recovery ? (recovery === "trashed" ? "原阅读笔记在回收站。" : "原阅读笔记已移除。") + (created ? "已建立新笔记" : "已重新关联现有阅读笔记") + "，并保留倒计时和金字塔草稿。" : "";
@@ -205,6 +209,26 @@ var ReadingFlowIntegration = (function () {
     })();
     noteQueues.set(key, operation);
     try { return await operation; } finally { if (noteQueues.get(key) === operation) noteQueues.delete(key); }
+  }
+  async function cleanLegacyNoteTags(note, item, parentID) {
+    if (parentID === null || !validNativeNote(note, item, parentID)) return;
+    let previousTags = null;
+    try {
+      if (typeof note.loadDataType === "function") await note.loadDataType("tags");
+      if (!note.hasTag(SIDEBAR_NOTE_TAG)) return;
+      await Zotero.DB.executeTransaction(async () => {
+        if (!validNativeNote(note, item, parentID) || !Zotero.Libraries.get(item.libraryID)?.editable || !note.hasTag(SIDEBAR_NOTE_TAG)) return;
+        previousTags = note.getTags();
+        note.removeTag(SIDEBAR_NOTE_TAG); note.removeTag("Reading Flow");
+        await note.save({ skipDateModifiedUpdate: true });
+      });
+    } catch (error) {
+      if (previousTags) {
+        if (typeof note.reload === "function") { try { await note.reload(["tags"], true); } catch (reloadError) { Zotero.logError(reloadError); } }
+        else note.setTags(previousTags);
+      }
+      Zotero.logError(error);
+    }
   }
   async function flushNative(handle) {
     stopSavingUnboundNote(handle);
@@ -654,6 +678,10 @@ var ReadingFlowIntegration = (function () {
         synced = { ...synced, token: saved.token, needsPublish: false };
       }
       if (focusVersions.get(key) !== focusVersion) return null;
+      // Keep legacy recovery tags until the accepted synced state contains the
+      // same note key, so another device can still recover a failed publication.
+      if (!readOnly && !synced.conflict && !synced.pending && !handle.syncToken?.pending && handle.syncToken?.selected) await cleanLegacyNoteTags(note, item, parentID);
+      if (!active || generation !== handle.generation || focusVersions.get(key) !== focusVersion) return null;
       if (handle.item && activeHandles.get(sessionKey(handle.item)) === handle) activeHandles.delete(sessionKey(handle.item));
       const rebuilt = await rebuildInvalidatedEditor(handle, note, generation); if (!active || generation !== handle.generation) return null;
       const noteChanged = rebuilt || handle.note !== note;

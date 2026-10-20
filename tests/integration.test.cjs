@@ -132,6 +132,8 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
     constructor(type) { assert.equal(type, 'note'); this.tags = []; this.deleted = false; }
     setNote(html) { this.html = html; } getNote() { return this.html; } addTag(tag) { if (!this.tags.includes(tag)) this.tags.push(tag); } hasTag(tag) { return this.tags.includes(tag); } isNote() { return true; } isRegularItem() { return false; }
     getTags() { return this.tags.map(tag => ({ tag, type: 0 })); }
+    removeTag(tag) { this.tags = this.tags.filter(value => value !== tag); }
+    setTags(tags) { this.tags = tags.map(value => value.tag); }
     get parentKey() { return this.parentID ? items.get(this.parentID)?.key || false : false; }
     set parentKey(key) { this.parentID = key ? [...items.values()].find(item => item.libraryID === this.libraryID && item.key === key)?.id : null; }
     get topLevelItem() { return this.parentID ? items.get(this.parentID) || this : this; }
@@ -172,7 +174,11 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
     Prefs: { get: name => prefs.get(name), set: (name, value) => prefs.set(name, value), clear: name => prefs.delete(name) },
     Items: { get: id => Array.isArray(id) ? id.map(value => items.get(value)).filter(Boolean) : items.get(id), getAsync: async id => Array.isArray(id) ? id.map(value => items.get(value)).filter(Boolean) : items.get(id) || null, getAll: async (libraryID, onlyTopLevel = false, includeDeleted = false) => [...items.values()].filter(item => item.libraryID === libraryID && (!onlyTopLevel || !item.parentID) && (includeDeleted || !item.deleted)), getByLibraryAndKeyAsync: async (libraryID, key) => [...items.values()].find(item => item.libraryID === libraryID && item.key === key) || null },
     Libraries: { get: id => libraries.get(id), getAll: () => [...libraries].map(([libraryID, value]) => ({ ...value, libraryID })) }, getMainWindow: () => host, getMainWindows: () => [host], logError: error => errors.push(error),
-    addShutdownListener: listener => shutdownListeners.push(listener), debug: message => debugMessages.push(message), DB: { async waitForTransaction() { dbCalls.push('wait'); }, async executeTransaction(callback) { dbCalls.push('transaction'); return callback(); }, async valueQueryAsync(sql, params) { dbCalls.push('query'); assert.match(sql, /SELECT note FROM itemNotes WHERE itemID\s*=\s*\?/i); return items.get(params[0])?.html ?? null; } },
+    addShutdownListener: listener => shutdownListeners.push(listener), debug: message => debugMessages.push(message), DB: { async waitForTransaction() { dbCalls.push('wait'); }, async executeTransaction(callback) {
+      dbCalls.push('transaction'); const previousItems = new Map(items), previousNotes = [...notes], tags = new Map(notes.map(note => [note, [...note.tags]]));
+      try { return await callback(); }
+      catch (error) { items.clear(); for (const [id, item] of previousItems) items.set(id, item); notes.splice(0, notes.length, ...previousNotes); for (const [note, previousTags] of tags) note.tags = previousTags; throw error; }
+    }, async valueQueryAsync(sql, params) { dbCalls.push('query'); assert.match(sql, /SELECT note FROM itemNotes WHERE itemID\s*=\s*\?/i); return items.get(params[0])?.html ?? null; } },
     MenuManager: { registerMenu(descriptor) { const id = 'registered:' + descriptor.pluginID + ':' + descriptor.menuID; menus.set(id, descriptor); return id; }, unregisterMenu(id) { assert.ok(menus.has(id)); menus.delete(id); } },
     ItemPaneManager: { registerSection(descriptor) {
       section = descriptor; sectionID = 'reading-flow@test:' + descriptor.paneID;
@@ -344,7 +350,7 @@ test('standalone pyramid insertion targets its own native note while selected ch
   await standalone.config.bridge.insertPyramid({ pngDataURL: 'data:image/png;base64,AAAA', width: 10, height: 10 }); assert.match(independent.html, /<img data-attachment-key="[A-Z0-9]{8}"/);
   assert.equal(child.html, '<p>A child note I wrote</p>'); const managed = await h.Zotero.ReadingFlow.openItem(child.id);
   assert.equal(managed.item.key, h.parent.key); assert.equal(managed.parentID, h.parent.id); assert.notEqual(managed.note, child); assert.notEqual(managed.note, independent);
-  assert.equal(managed.note.parentID, h.parent.id); assert.ok(managed.note.hasTag('Reading Flow · sidebar')); assert.equal(h.proseNotes().length, 3);
+  assert.equal(managed.note.parentID, h.parent.id); assert.deepEqual(managed.note.tags, []); assert.equal(h.proseNotes().length, 3);
   assert.equal(child.html, '<p>A child note I wrote</p>'); assert.deepEqual(child.tags, []); assert.equal(h.files.has(h.draftName(child)), false); assert.equal(h.durable(independent).noteKey, independent.key);
 });
 
@@ -491,11 +497,11 @@ test('PDF note targeting flushes pending native prose and follows the original e
   assert.equal(h.proseNotes().length, 2); assert.equal(h.files.has(h.draftName(h.parent)), false);
 });
 
-test('opens a native sidebar for a PDF parent, creates one marked child note, and never uses openDialog', async t => {
+test('opens a native sidebar for a PDF parent, creates one untagged child note, and never uses openDialog', async t => {
   const h = harness(); await h.start(); t.after(() => h.stop());
   const [a, b] = await Promise.all([h.Zotero.ReadingFlow.openItem(10), h.Zotero.ReadingFlow.openItem(20)]);
   assert.equal(a, b); assert.equal(a.hostWindow, h.host); assert.equal(a.deck.selectedPanel, a.panel); assert.equal(a.editor.item, a.note);
-  assert.equal(h.proseNotes().length, 1); assert.ok(a.note.hasTag('Reading Flow · sidebar')); assert.equal(h.durable().noteKey, a.note.key);
+  assert.equal(h.proseNotes().length, 1); assert.deepEqual(a.note.tags, []); assert.equal(h.durable().noteKey, a.note.key);
   const icons = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8')).icons;
   assert.equal(h.getSection().sidenav.icon, 'chrome://reading-flow/' + icons['32']); assert.equal(h.getSection().header.icon, h.getSection().sidenav.icon);
   for (const icon of Object.values(icons)) assert.ok(fs.existsSync(path.join(__dirname, '..', icon)));
@@ -521,6 +527,49 @@ test('cold rail reopen keeps a correctly bound note whose mutable sidebar tags w
   const reopened = await cold.clickRail();
   assert.equal(reopened.note, original); assert.equal(cold.proseNotes().length, 1); assert.equal(original.html, '<p>Keep untagged native prose.</p>');
   assert.deepEqual(original.tags, []); assert.equal(cold.writes.length, 0); assert.equal(reopened.toolsWindow.ReadingFlowApp.notice, '');
+});
+
+test('opening a legacy reading note removes only its automatic labels and keeps the saved association', async t => {
+  const first = harness(); await first.start(); const opened = await first.clickRail();
+  opened.note.html = '<p>My existing reading prose.</p>'; opened.note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'Personal research'];
+  opened.getState().pyramid.text = 'Existing pyramid'; await opened.config.bridge.flushState(opened.getState()); await first.stop();
+  const cold = coldHarness(first); await cold.start(); const restored = await cold.clickRail();
+  assert.equal(restored.note.key, opened.note.key); assert.equal(restored.note.html, '<p>My existing reading prose.</p>'); assert.deepEqual(restored.note.tags, ['Personal research']);
+  assert.equal(restored.getState().pyramid.text, 'Existing pyramid'); assert.equal(cold.durable().noteKey, restored.note.key); assert.equal(cold.proseNotes().length, 1);
+  await cold.stop(); const next = coldHarness(cold); await next.start(); t.after(() => next.stop()); const reopened = await next.clickRail();
+  assert.equal(reopened.note.key, opened.note.key); assert.deepEqual(reopened.note.tags, ['Personal research']); assert.equal(next.proseNotes().length, 1);
+});
+
+test('legacy tag recovery persists a note key before removing its labels and preserves labels on a failed draft write', async t => {
+  for (const fail of [false, true]) await t.test(fail ? 'failed binding' : 'saved binding', async t => {
+    const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'My tag']; note.setNote('<p>Legacy body</p>'); await note.saveTx();
+    if (fail) h.failDraftWrite(); await h.start(); t.after(() => h.stop());
+    if (fail) { await assert.rejects(h.clickRail(), /atomic-write/); assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'My tag']); }
+    else { const handle = await h.clickRail(); assert.equal(handle.note, note); assert.equal(h.durable().noteKey, note.key); assert.deepEqual(note.tags, ['My tag']); }
+    assert.equal(note.html, '<p>Legacy body</p>'); assert.equal(h.proseNotes().length, 1);
+  });
+});
+
+test('legacy cleanup preserves independent, read-only, and user-assigned generic tags', async t => {
+  for (const kind of ['independent', 'read-only', 'generic-only']) await t.test(kind, async t => {
+    const h = harness(), note = await standaloneNote(h, 'Original body');
+    if (kind !== 'independent') note.parentID = h.parent.id;
+    note.tags = kind === 'generic-only' ? ['Reading Flow', 'Personal'] : ['Reading Flow', 'Reading Flow · sidebar', 'Personal'];
+    const expected = [...note.tags], owner = kind === 'independent' ? note : h.parent;
+    const state = h.core.createSession(h.identity(owner)); state.noteKey = note.key; h.files.set(h.draftName(owner), JSON.stringify(state));
+    if (kind === 'read-only') h.libraries.set(1, { editable: false });
+    await h.start(); t.after(() => h.stop()); const handle = await h.Zotero.ReadingFlow.openItem(owner.id);
+    assert.equal(handle.note, note); assert.deepEqual(note.tags, expected); assert.equal(note.html, '<p>Original body</p>');
+  });
+});
+
+test('a failed legacy tag save preserves its original tags and leaves the native note usable', async t => {
+  const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'Personal']; note.setNote('<p>Original body</p>'); await note.saveTx();
+  const save = note.save.bind(note); let failed = false;
+  note.save = async function () { if (!failed && !this.hasTag('Reading Flow · sidebar')) { failed = true; throw new Error('Simulated legacy tag save failure'); } return save(); };
+  await h.start(); t.after(() => h.stop()); const handle = await h.Zotero.ReadingFlow.openItem(h.parent.id);
+  assert.equal(handle.note, note); assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'Personal']); assert.equal(note.html, '<p>Original body</p>');
+  assert.equal(h.durable().noteKey, note.key); assert.equal(h.proseNotes().length, 1); assert.equal(h.errors.length, 1); assert.match(h.errors[0].message, /legacy tag save failure/);
 });
 
 test('cold rail reopen replaces a trashed binding while backing up the exact draft and retaining original prose in the trash', async t => {
@@ -550,14 +599,31 @@ test('repeated hot rail clicks recover a trashed note once and never flush a sta
   assert.equal(h.host.ZoteroContextPane.activeEditor, handle.editor);
 });
 
-test('a failed relink after note creation keeps the old draft and can retry without making a duplicate replacement', async t => {
+test('a failed relink rolls back new untagged prose and retries after restart without a duplicate', async t => {
   const h = harness(), state = h.core.createSession(h.identity(h.parent)); state.noteKey = 'MISSING1'; state.pyramid.text = 'Keep this draft'; state.futureProperty = { values: [1, 2, 3] };
   const raw = JSON.stringify(state); h.files.set(h.draftName(h.parent), raw); await h.start(); t.after(() => h.stop()); h.failDraftWrite();
-  await assert.rejects(() => h.clickRail(), /atomic-write/); assert.equal(h.files.get(h.draftName(h.parent)), raw); assert.equal(h.proseNotes().length, 1);
-  const createdKey = h.proseNotes()[0].key; assert.equal([...h.files].filter(([name]) => name.includes('.before-note-relink-'))[0][1], raw);
-  // Clear only the test's observed error; the integration must clear its rejected queue itself.
-  h.errors.length = 0; const recovered = await h.clickRail(); assert.equal(h.proseNotes().length, 1); assert.equal(recovered.note.key, createdKey); assert.equal(h.durable().noteKey, createdKey);
-  assert.equal(h.durable().pyramid.text, 'Keep this draft'); for (const [, content] of [...h.files].filter(([name]) => name.includes('.before-note-relink-'))) assert.equal(content, raw);
+  await assert.rejects(() => h.clickRail(), /atomic-write/); assert.equal(h.files.get(h.draftName(h.parent)), raw); assert.equal(h.proseNotes().length, 0);
+  assert.equal([...h.files].filter(([name]) => name.includes('.before-note-relink-'))[0][1], raw);
+  await h.stop(); const cold = coldHarness(h); await cold.start(); t.after(() => cold.stop());
+  const recovered = await cold.clickRail(); assert.equal(cold.proseNotes().length, 1); assert.deepEqual(recovered.note.tags, []); assert.equal(cold.durable().noteKey, recovered.note.key);
+  assert.equal(cold.durable().pyramid.text, 'Keep this draft'); for (const [, content] of [...cold.files].filter(([name]) => name.includes('.before-note-relink-'))) assert.equal(content, raw);
+});
+
+test('a native commit failure after the draft write preserves a recoverable key and creates one replacement', async t => {
+  const h = harness(), state = h.core.createSession(h.identity(h.parent)); state.pyramid.text = 'Keep my reasoning'; h.files.set(h.draftName(h.parent), JSON.stringify(state));
+  const transaction = h.Zotero.DB.executeTransaction; let failed = false;
+  h.Zotero.DB.executeTransaction = callback => transaction(async () => { const result = await callback(); if (!failed && h.notes.length === 1) { failed = true; throw new Error('Simulated native commit failure'); } return result; });
+  await h.start(); t.after(() => h.stop()); await assert.rejects(h.Zotero.ReadingFlow.openItem(h.parent.id), /commit failure/);
+  const beforeRetry = h.files.get(h.draftName(h.parent)); assert.equal(h.notes.length, 0); assert.ok(JSON.parse(beforeRetry).noteKey); assert.equal(JSON.parse(beforeRetry).pyramid.text, 'Keep my reasoning');
+  const handle = await h.Zotero.ReadingFlow.openItem(h.parent.id); assert.equal(h.proseNotes().length, 1); assert.equal(h.durable().noteKey, handle.note.key); assert.deepEqual(handle.note.tags, []);
+  assert.equal(handle.getState().pyramid.text, 'Keep my reasoning'); assert.ok([...h.files].some(([name, content]) => name.includes('.before-note-relink-') && content === beforeRetry));
+});
+
+test('a failed sync publication retains legacy discovery tags for another device', async t => {
+  const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'Personal']; note.setNote('<p>Original body</p>'); await note.saveTx();
+  await h.start(); t.after(() => h.stop()); h.fileStore.write = async () => { throw new Error('Simulated sync file failure'); };
+  await assert.rejects(h.Zotero.ReadingFlow.openItem(h.parent.id), /sync file failure/);
+  assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'Personal']); assert.equal(note.html, '<p>Original body</p>'); assert.equal(h.durable().noteKey, note.key); assert.equal(h.proseNotes().length, 1);
 });
 
 test('a stale or invalid native-note bridge cannot save another paper or insert into a trashed note', async t => {
