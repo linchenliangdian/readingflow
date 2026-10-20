@@ -1,6 +1,6 @@
 {
   "name": "reading-flow-zotero",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "private": true,
   "description": "A tool for better reading and note-taking",
   "scripts": { "test": "node --test tests/*.test.cjs" },
