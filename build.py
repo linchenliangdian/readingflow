@@ -10,6 +10,16 @@ from scripts.release import repository_name, update_url
 ROOT = Path(__file__).resolve().parent
 FILES = ["manifest.json", "bootstrap.js", "content/integration.js", "content/core.js", "content/sync.js", "content/app.xhtml", "content/app.js", "content/style.css", "content/icons/pyramid.svg", "LICENSE"]
 
+def validate_resource_versions(source, version):
+    document = ET.parse(source).getroot()
+    namespace = {"h": "http://www.w3.org/1999/xhtml"}
+    urls = [node.get("href") for node in document.findall("h:head/h:link[@rel='stylesheet']", namespace)]
+    urls += [node.get("src") for node in document.findall("h:head/h:script[@src]", namespace)]
+    expected = [f"{name}?v={version}" for name in ("style.css", "core.js", "app.js")]
+    if urls != expected:
+        raise ValueError("Sidebar stylesheet and script URLs must use the current manifest version to avoid cached resources")
+
+
 def build(repository=None):
     manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
     if repository:
@@ -24,7 +34,7 @@ def build(repository=None):
         assert (ROOT / filename).is_file(), f"Manifest icon does not exist: {filename}"
         if filename.endswith(".svg"):
             assert ET.parse(ROOT / filename).getroot().tag == "{http://www.w3.org/2000/svg}svg"
-    ET.parse(ROOT / "content/app.xhtml")
+    validate_resource_versions(ROOT / "content/app.xhtml", manifest["version"])
     out = ROOT / "output" / f"reading-flow-{manifest['version']}.xpi"
     out.parent.mkdir(exist_ok=True)
     # Store the small text files directly so zlib versions cannot change hashes.

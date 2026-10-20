@@ -50,7 +50,7 @@ function sandbox({ failStart = false, failStop = false, backgroundUpdates = AUTO
       io: { newURI: value => value },
       scriptloader: { loadSubScript(uri) {
         calls.push({ name: 'script', uri });
-        if (uri.endsWith('integration.js')) {
+        if (uri.split('?')[0].endsWith('integration.js')) {
           scope.ReadingFlowIntegration = {
             async start() { calls.push({ name: 'start' }); if (failStart) throw new Error('start failed'); },
             async stop() { calls.push({ name: 'stop' }); if (failStop) throw new Error('stop failed'); }
@@ -71,10 +71,24 @@ test('bootstrap uses supported Components globals, registers chrome and cleans l
   assert.equal(calls[0].uri, args.rootURI + 'manifest.json');
   assert.deepEqual(calls[0].entries, [['content', 'reading-flow', 'content/']]);
   assert.deepEqual(calls.filter(c => c.name === 'script').map(c => c.uri), [
-    'chrome://reading-flow/content/core.js', 'chrome://reading-flow/content/sync.js', 'chrome://reading-flow/content/integration.js'
+    'chrome://reading-flow/content/core.js?v=1.0.0', 'chrome://reading-flow/content/sync.js?v=1.0.0', 'chrome://reading-flow/content/integration.js?v=1.0.0'
   ]);
   await scope.shutdown();
   assert.deepEqual(calls.slice(-2).map(c => c.name), ['stop', 'destruct']);
+});
+
+test('every privileged script has an encoded version key that changes across an in-process upgrade', async () => {
+  const { scope, calls } = sandbox(), versions = ['2.1.7', '2.1.8+test&fragment#'];
+  const requests = [];
+  for (const version of versions) {
+    const previous = calls.length;
+    await scope.startup({ ...args, version });
+    const scripts = calls.slice(previous).filter(call => call.name === 'script').map(call => call.uri);
+    assert.deepEqual(scripts, ['core.js', 'sync.js', 'integration.js'].map(name => 'chrome://reading-flow/content/' + name + '?v=' + encodeURIComponent(version)));
+    requests.push(scripts); await scope.shutdown();
+  }
+  for (let index = 0; index < requests[0].length; index++) assert.notEqual(requests[0][index], requests[1][index]);
+  assert.equal(calls.filter(call => call.name === 'destruct').length, 2);
 });
 
 test('failed startup unregisters chrome and leaves no handle for duplicate teardown', async () => {

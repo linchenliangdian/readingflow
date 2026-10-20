@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Reading flow",
-  "version": "2.1.7",
+  "version": "2.1.8",
   "description": "A tool for better reading and note-taking",
   "author": "Reading Flow",
   "homepage_url": "https://github.com/linchenliangdian/readingflow#readme",

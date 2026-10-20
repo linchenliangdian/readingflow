@@ -10,6 +10,7 @@ var ReadingFlowIntegration = (function () {
   const unsavedNotes = new WeakMap();
   const localRecords = new Map();
   let syncStore = null, migrationPromise = null, syncRefreshTimer = null;
+  let resourceVersion = "";
   let active = false, dataDirectory = null, FilePicker = null, publicAPI = null, registeredPaneID = null, readerHandler = null, notifierID = null, stopPromise = null;
   function sessionKey(item) { return item.libraryID + "-" + item.key; }
   function draftPath(item) { return PathUtils.join(dataDirectory, sessionKey(item) + ".json"); }
@@ -588,7 +589,7 @@ var ReadingFlowIntegration = (function () {
       // Gecko can suppress a hidden subframe's load notification during a XUL deck switch.
       // The ready app is the same success condition and never depends on a popup.
       poll = handle.hostWindow.setInterval(loaded, 100);
-      handle.frame.setAttribute("src", "chrome://reading-flow/content/app.xhtml?sidebar=" + generation);
+      handle.frame.setAttribute("src", "chrome://reading-flow/content/app.xhtml?v=" + encodeURIComponent(resourceVersion) + "&sidebar=" + generation);
     });
   }
   async function openInHandle(handle, parent, options = {}) {
@@ -787,7 +788,8 @@ var ReadingFlowIntegration = (function () {
       catch (error) { Zotero.logError(new Error("Reading flow：旧草稿仍保留，迁移未完成。" + path + "\n" + (error.message || error))); }
     }
   }
-  async function start({ id }) {
+  async function start({ id, version }) {
+    resourceVersion = typeof version === "string" ? version : "";
     if (!Zotero.ItemPaneManager || !Zotero.ItemPaneManager.registerSection) throw new Error("当前 Zotero 缺少所需的侧栏接口。");
     ({ FilePicker } = ChromeUtils.importESModule("chrome://zotero/content/modules/filePicker.mjs")); dataDirectory = PathUtils.join(Zotero.DataDirectory.dir, "reading-flow"); stopPromise = null; active = true;
     syncStore = ReadingFlowSync.create({ Zotero, core });

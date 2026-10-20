@@ -20,15 +20,16 @@ async function startup({ id, version, rootURI }) {
     Services.io.newURI(rootURI + "manifest.json"),
     [["content", "reading-flow", "content/"]]
   );
+  var resourceQuery = "?v=" + encodeURIComponent(version);
   try {
     Services.scriptloader.loadSubScript(
-      "chrome://reading-flow/content/core.js", readingFlowBootstrapGlobal, "UTF-8"
+      "chrome://reading-flow/content/core.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
     );
     Services.scriptloader.loadSubScript(
-      "chrome://reading-flow/content/sync.js", readingFlowBootstrapGlobal, "UTF-8"
+      "chrome://reading-flow/content/sync.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
     );
     Services.scriptloader.loadSubScript(
-      "chrome://reading-flow/content/integration.js", readingFlowBootstrapGlobal, "UTF-8"
+      "chrome://reading-flow/content/integration.js" + resourceQuery, readingFlowBootstrapGlobal, "UTF-8"
     );
     await ReadingFlowIntegration.start({ id, version, rootURI });
   }

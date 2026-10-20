@@ -7,7 +7,7 @@ const path = require('node:path');
 const { webcrypto } = require('node:crypto');
 const read = name => fs.readFileSync(path.join(__dirname, '..', 'content', name), 'utf8');
 
-function harness({ scanDrafts = false } = {}) {
+function harness({ scanDrafts = false, coldTools = false } = {}) {
   const files = new Map(), prefs = new Map(), items = new Map(), notes = [], menus = new Map(), writes = [], pickerResponses = [], pickerRequests = [], errors = [], shutdownListeners = [], debugMessages = [], dbCalls = [], resizeObservers = [], observers = new Map(), noteWrites = [], imagePosts = [];
   const libraries = new Map([[1, { editable: true }]]), inFlight = new Map(), maximumInFlight = new Map(), blockedReads = new Map();
   let nextID = 1000, nextObserverID = 1, failNextWrite = false, failWritePath = null, section = null, sectionID = null, context, librarySelection = null;
@@ -20,7 +20,7 @@ function harness({ scanDrafts = false } = {}) {
     get isConnected() { return !!(this.parentElement || this.root); }
     append(...nodes) { for (const node of nodes) { node.parentElement = this; this.children.push(node); } }
     remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(node => node !== this); this.parentElement = null; }
-    setAttribute(key, value) { this.attributes.set(key, String(value)); } removeAttribute(key) { this.attributes.delete(key); } getAttribute(key) { return this.attributes.get(key) || null; }
+    setAttribute(key, value) { this.attributes.set(key, String(value)); if (key === 'src' && this.localName === 'iframe') this.src = String(value); } removeAttribute(key) { this.attributes.delete(key); } getAttribute(key) { return this.attributes.get(key) || null; }
     addEventListener(type, handler) { if (!this.listeners.has(type)) this.listeners.set(type, new Set()); this.listeners.get(type).add(handler); }
     removeEventListener(type, handler) { this.listeners.get(type)?.delete(handler); }
     querySelectorAll() { return this.buttons || []; }
@@ -44,10 +44,11 @@ function harness({ scanDrafts = false } = {}) {
       const node = new Node(name, this);
       if (name === 'iframe') {
         const tools = { CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } } };
-        tools.ReadingFlowApp = { state: null, notice: '', dirty: false, async loadConfig(config) { this.state = JSON.parse(JSON.stringify(config.initialState)); this.dirty = false; }, getState() { return this.state; }, hasPendingChanges() { return this.dirty; }, async flushPendingSave() {}, showNotice(message) { this.notice = message; } };
+        const app = { state: null, notice: '', dirty: false, async loadConfig(config) { this.state = JSON.parse(JSON.stringify(config.initialState)); this.dirty = false; }, getState() { return this.state; }, hasPendingChanges() { return this.dirty; }, async flushPendingSave() {}, showNotice(message) { this.notice = message; } };
+        if (!coldTools) tools.ReadingFlowApp = app;
         tools.dispatchEvent = event => { if (event.type === 'reading-flow-config') tools.ReadingFlowApp.loadConfig(event.detail); };
         node.contentWindow = tools;
-        Object.defineProperty(node, 'src', { set(value) { node.url = value; queueMicrotask(() => { for (const handler of Array.from(node.listeners.get('load') || [])) handler(); }); }, get: () => node.url });
+        Object.defineProperty(node, 'src', { set(value) { node.url = value; queueMicrotask(() => { tools.ReadingFlowApp = app; for (const handler of Array.from(node.listeners.get('load') || [])) handler(); }); }, get: () => node.url });
       }
       return node;
     },
@@ -202,7 +203,7 @@ function harness({ scanDrafts = false } = {}) {
   const identity = item => ({ libraryID: item.libraryID, key: item.key, title: item.getField('title') });
   const draftName = item => 'D:/fake-zotero-data/reading-flow/' + item.libraryID + '-' + item.key + '.json';
   return { files, prefs, items, notes, proseNotes: () => notes.filter(note => !context.ReadingFlowSync?.decodeNote(note.html)), menus, writes, pickerResponses, pickerRequests, libraries, maximumInFlight, errors, Zotero, host, parent, other, attachment, identity, draftName, originalActiveEditor, shutdownListeners, debugMessages, dbCalls, resizeObservers, observers, noteWrites, imagePosts, libraryPane, libraryNav, readerContext, nativeNoteRenderResult, core: context.ReadingFlowCore, sync: context.ReadingFlowSync, getSection: () => section,
-    start: () => context.ReadingFlowIntegration.start({ id: 'reading-flow@test' }), stop: () => context.ReadingFlowIntegration.stop(),
+    start: (version = '1.0.0') => context.ReadingFlowIntegration.start({ id: 'reading-flow@test', version }), stop: () => context.ReadingFlowIntegration.stop(),
     failWrite: () => { failNextWrite = true; }, failDraftWrite: (item = parent) => { failWritePath = draftName(item); }, durable: (item = parent) => JSON.parse(files.get(draftName(item))),
     restoreNote(saved) { const note = new Note('note'); Object.assign(note, { id: saved.id, key: saved.key, libraryID: saved.libraryID, parentID: saved.parentID, html: saved.html, tags: [...saved.tags], deleted: saved.deleted }); items.set(note.id, note); notes.push(note); nextID = Math.max(nextID, note.id + 1); return note; },
     async clickRail(kind = 'library') {
@@ -246,6 +247,22 @@ async function waitUntil(predicate, message) {
 async function standaloneNote(h, text = 'An independent note') {
   const note = new h.Zotero.Item('note'); note.libraryID = 1; note.setNote('<p>' + text + '</p>'); await note.saveTx(); return note;
 }
+
+test('sidebars with the same generation request different tool documents across plugin versions', async t => {
+  const requests = [];
+  for (const version of ['2.1.7', '2.1.8+test&fragment#']) {
+    const h = harness({ coldTools: true }); await h.start(version); t.after(() => h.stop());
+    const handle = await h.clickRail(), source = handle.frame.getAttribute('src');
+    assert.ok(source.startsWith('chrome://reading-flow/content/app.xhtml?v=' + encodeURIComponent(version) + '&sidebar='));
+    const parsed = new URL(source);
+    assert.equal(parsed.searchParams.get('v'), version);
+    assert.equal(parsed.searchParams.get('sidebar'), String(handle.generation));
+    assert.deepEqual([...parsed.searchParams.keys()], ['v', 'sidebar']);
+    requests.push({ source, generation: handle.generation });
+  }
+  assert.equal(requests[0].generation, requests[1].generation);
+  assert.notEqual(requests[0].source, requests[1].source);
+});
 
 test('standalone note rail and context menu bind the exact existing note without rewriting prose or adding tags', async t => {
   const h = harness(), note = await standaloneNote(h, 'My own unstructured note'); note.addTag('Personal');
