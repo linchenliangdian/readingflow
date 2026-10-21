@@ -20,13 +20,13 @@ test('legacy note codec remains a bounded, lossless migration reader', t => {
   assert.throws(() => sync.decodePayload('not valid base64!'), /损坏/);
 });
 
-test('all owners share a central native item and one current writer file without creating sync notes', async t => {
+test('all owners share a central native item with immutable snapshots without creating sync notes', async t => {
   const d = device(t), second = d.addOwner('PAPER002'), note = d.addOwner('OWNNOTE1', 'note'), original = note.getNote();
   await publish(d, stateFor(d, d.owner, 'First paper'));
   await publish(d, stateFor(d, second, 'Second paper'), second);
   await publish(d, stateFor(d, note, 'Independent reasoning'), note);
   assert.equal(d.containers().length, 1); assert.equal(d.containers()[0].getField('title'), 'Reading flow 数据');
-  assert.equal(d.attachments().length, 1); assert.equal(d.legacyNotes().length, 0);
+  assert.equal(d.attachments().length, 3); assert.equal(d.legacyNotes().length, 0);
   assert.equal(d.nativeNotes().length, 1); assert.equal(note.getNote(), original);
   const records = (await d.fileStore.read(1)).records.map(value => value.record);
   assert.deepEqual(new Set(records.map(record => record.ownerKey)), new Set(['PAPER001', 'PAPER002', 'OWNNOTE1']));
@@ -110,7 +110,7 @@ test('timer expiry leaves the saved snapshot fingerprint stable and permits an a
   const current = await d.store.load(d.identity(d.owner));
   assert.equal(current.state.pyramid.text, opened.state.pyramid.text); assert.equal(current.state.timers.inspection.status, 'expired');
   const records = (await d.fileStore.read(1)).records;
-  assert.equal(records.length, 1); assert.equal(records[0].record.hash, sync.stateHash(records[0].record.state));
+  assert.equal(records.length, 2); assert.ok(records.every(value => value.record.hash === sync.stateHash(value.record.state)));
 });
 
 test('a causal remote edit supersedes a clean cache whose running timer expired while closed', async t => {
@@ -266,7 +266,39 @@ test('saving another owner does not invalidate the current owner token', async t
   opened.state.pyramid.text = 'Still valid edit'; await d.store.save(d.identity(d.owner), opened.state, opened.token);
   assert.equal((await d.store.load(d.identity(d.owner))).state.pyramid.text, 'Still valid edit');
   assert.equal((await d.store.load(d.identity(second))).state.pyramid.text, 'Separate reasoning');
-  assert.equal(d.attachments().length, 1);
+  assert.equal(d.attachments().length, 3);
+});
+
+test('the same authenticated revision in a different immutable source keeps an open editor token valid', async t => {
+  const d = device(t), first = await publish(d), second = d.addOwner('PAPER002');
+  await publish(d, stateFor(d, second, 'Another paper carried in a later snapshot'), second);
+  const opened = await d.store.load(d.identity(d.owner)), container = d.containers()[0];
+  const attachmentOrder = container.getAttachments.bind(container);
+  container.getAttachments = () => attachmentOrder().reverse();
+  const reordered = await d.store.load(d.identity(d.owner));
+  assert.equal(reordered.token.fingerprint, opened.token.fingerprint, 'file enumeration order cannot turn a copied revision into an edit');
+  opened.state.pyramid.text = 'Editing continues from the same logical head';
+  await d.store.save(d.identity(d.owner), opened.state, opened.token);
+  const restored = await d.store.load(d.identity(d.owner));
+  assert.equal(restored.conflict, false); assert.equal(restored.versions.length, 1);
+  assert.equal(restored.state.pyramid.text, opened.state.pyramid.text);
+  assert.equal(first.state.pyramid.text, 'A conclusion');
+});
+
+test('repeated publications on one device restore one latest version while preserving every earlier snapshot', async t => {
+  const d = device(t); let current = await d.store.load(d.identity(d.owner));
+  for (let index = 0; index < 5; index++) {
+    current.state.pyramid.text = 'Latest complete edit ' + index;
+    await d.store.save(d.identity(d.owner), current.state, current.token);
+    current = await d.store.load(d.identity(d.owner));
+    assert.equal(current.conflict, false); assert.equal(current.pending, false); assert.equal(current.versions.length, 1);
+  }
+  assert.equal(d.attachments().length, 5);
+  const cold = device(t, { name: 'B' }); cold.receive(d);
+  const restored = await cold.store.load(cold.identity(cold.owner));
+  assert.equal(restored.conflict, false); assert.equal(restored.versions.length, 1);
+  assert.equal(restored.state.pyramid.text, 'Latest complete edit 4');
+  assert.equal((await cold.fileStore.read(1)).records.length, 5, 'all earlier revisions remain recoverable');
 });
 
 test('reparented legacy metadata is neither adopted by a different owner nor removed as migrated', async t => {

@@ -27,29 +27,32 @@ test('journal codec preserves Unicode, formatting, owners and integrity without 
   assert.throws(() => files.decodeJournal(files.encodeJournal('writer-1', [record, record])), /重复/);
 });
 
-test('serialized writes aggregate owners while replacing only the active writer current owner record', async t => {
+test('serialized publications aggregate owners in immutable snapshots and preserve earlier revisions', async t => {
   const d = device(t), other = d.addOwner('PAPER002'), active = d.fileStore.writerID;
   const a = recordFor(d, stateFor(d, d.owner, 'A v1'), { deviceID: active }), b = recordFor(d, stateFor(d, other, 'B v1'), { owner: other, deviceID: active });
   await Promise.all([d.fileStore.write(1, [a]), d.fileStore.write(1, [b])]);
-  assert.equal(d.containers().length, 1); assert.equal(d.attachments().length, 1);
+  assert.equal(d.containers().length, 1); assert.equal(d.attachments().length, 2);
   const next = recordFor(d, stateFor(d, d.owner, 'A v2'), { deviceID: active, clock: { [active]: 2 } });
   await d.fileStore.write(1, [next]); const read = await d.fileStore.read(1);
-  assert.equal(read.pending.length, 0); assert.equal(read.records.length, 2);
-  assert.deepEqual(new Set(read.records.map(value => value.record.state.pyramid.text)), new Set(['A v2', 'B v1']));
+  assert.equal(read.pending.length, 0); assert.equal(read.records.length, 3);
+  assert.deepEqual(new Set(read.records.map(value => value.record.state.pyramid.text)), new Set(['A v1', 'A v2', 'B v1']));
+  const latest = files.decodeJournal(fs.readFileSync(d.attachments().at(-1).filePath, 'utf8'));
+  assert.deepEqual(new Set(latest.records.map(value => value.state.pyramid.text)), new Set(['A v2', 'B v1']));
   const prior = recordFor(d, stateFor(d, d.owner, 'Conflict retained'), { deviceID: active, clock: { [active]: 3 } });
-  await d.fileStore.write(1, [prior], { replaceOwnCurrent: false }); assert.equal((await d.fileStore.read(1)).records.length, 3);
+  await d.fileStore.write(1, [prior], { replaceOwnCurrent: false }); assert.equal((await d.fileStore.read(1)).records.length, 4);
 });
 
 test('removing every tag during an active writer lease preserves binding and all owners on the next save', async t => {
   const d = device(t), active = d.fileStore.writerID, other = d.addOwner('PAPER002');
   const first = recordFor(d, stateFor(d, d.owner, 'Original tagless reasoning'), { deviceID: active });
-  await d.fileStore.write(1, [first]); const file = d.attachments()[0], container = d.containers()[0];
+  await d.fileStore.write(1, [first]); const file = d.attachments()[0], container = d.containers()[0], before = fs.readFileSync(file.filePath, 'utf8');
   removeAllTags(d);
   const second = recordFor(d, stateFor(d, other, 'Second owner reasoning'), { owner: other, deviceID: active });
   await d.fileStore.write(1, [second]);
   assert.equal(d.fileStore.isManagedItem(container), true); assert.equal(d.fileStore.isManagedItem(file), true);
-  assert.equal(d.containers().length, 1); assert.equal(d.attachments().length, 1);
+  assert.equal(d.containers().length, 1); assert.equal(d.attachments().length, 2);
   assert.equal(d.attachments()[0].key, file.key); assert.equal(d.containers()[0].key, container.key);
+  assert.equal(fs.readFileSync(file.filePath, 'utf8'), before);
   assert.deepEqual((await d.fileStore.read(1)).records.map(value => value.record), [first, second]);
   assert.ok([...d.items.values()].every(item => item.getTags().length === 0), 'saving cannot recreate tags');
 });
@@ -167,11 +170,50 @@ test('only exact bytes confirmed by Zotero file sync authorize uploaded records'
   d.uploadAll(); fs.unlinkSync(item.filePath); assert.equal(await d.fileStore.uploaded(1, [record]), false);
 });
 
-test('atomic rewrite failure leaves every owner record and uploaded confirmation unchanged', async t => {
+test('a failed snapshot publication leaves every old owner record and uploaded confirmation unchanged', async t => {
   const d = device(t), a = recordFor(d), second = d.addOwner('PAPER002'), b = recordFor(d, stateFor(d, second), { owner: second });
   await d.fileStore.write(1, [a, b]); d.uploadAll(); const item = d.attachments()[0], before = fs.readFileSync(item.filePath, 'utf8');
   d.failFileWriteAfter(1); await assert.rejects(() => d.fileStore.write(1, [recordFor(d, stateFor(d, d.owner, 'Failed edit'))]), /atomic file write failure/);
   assert.equal(fs.readFileSync(item.filePath, 'utf8'), before); assert.equal((await d.fileStore.read(1)).records.length, 2); assert.equal(await d.fileStore.uploaded(1, [a, b]), true);
+});
+
+test('publishing while an earlier native upload is in flight never edits its bytes or metadata', async t => {
+  const d = device(t), active = d.fileStore.writerID;
+  const first = recordFor(d, stateFor(d, d.owner, 'Snapshot being uploaded'), { deviceID: active });
+  await d.fileStore.write(1, [first]); const old = d.attachments()[0];
+  const oldText = fs.readFileSync(old.filePath, 'utf8'), oldMD5 = d.md5(old.filePath);
+  const beforeWrites = d.writes.length, originalImport = d.Zotero.Attachments.importFromFile;
+  d.Zotero.Attachments.importFromFile = async options => {
+    assert.equal(fs.readFileSync(old.filePath, 'utf8'), oldText, 'native upload still reads the exact bytes it started with');
+    assert.equal(old.attachmentSyncState, 'to_upload');
+    // Simulate Zotero completing the old upload while a newer snapshot is imported.
+    old.synced = true; old.attachmentSyncState = 2; old.attachmentSyncedHash = oldMD5;
+    return originalImport(options);
+  };
+  const next = recordFor(d, stateFor(d, d.owner, 'Later complete snapshot'), { deviceID: active, clock: { [active]: 2 } });
+  await d.fileStore.write(1, [next]);
+  assert.equal(d.attachments().length, 2); assert.notEqual(d.attachments()[1].attachmentFilename, old.attachmentFilename);
+  assert.equal(fs.readFileSync(old.filePath, 'utf8'), oldText);
+  assert.equal(old.attachmentSyncedHash, oldMD5); assert.equal(old.attachmentSyncState, 2); assert.equal(old.synced, true);
+  assert.ok(d.writes.slice(beforeWrites).every(value => value.key !== old.key), 'plugin never saves metadata of an imported earlier snapshot');
+  assert.equal(await d.fileStore.uploaded(1, [first]), true);
+  const count = d.writes.length, latest = d.attachments()[1];
+  await d.fileStore.write(1, [next]);
+  assert.equal(d.writes.length, count); assert.equal(d.attachments().length, 2, 'same-record publication is a no-op');
+  assert.equal(files.decodeJournal(fs.readFileSync(latest.filePath, 'utf8')).writerID, active);
+});
+
+test('identical carried records deduplicate but changed clocks or content cannot disappear as copies', async t => {
+  const d = device(t), first = recordFor(d);
+  await d.fileStore.write(1, [first]);
+  const other = d.addOwner('PAPER002');
+  await d.fileStore.write(1, [recordFor(d, stateFor(d, other), { owner: other })]);
+  assert.equal((await d.fileStore.read(1)).records.length, 2);
+  const second = d.attachments()[1], journal = files.decodeJournal(fs.readFileSync(second.filePath, 'utf8'));
+  journal.records[0].clock['another-device'] = 1;
+  fs.writeFileSync(second.filePath, files.encodeJournal(journal.writerID, journal.records));
+  const differing = await d.fileStore.read(1);
+  assert.equal(differing.records.length, 3, 'same identity with changed causal metadata stays available for validation');
 });
 
 test('file-store refuses read-only and attachment-read-only writes without creating a container', async t => {

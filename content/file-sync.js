@@ -1,9 +1,10 @@
 /*
  * Reading data is stored beneath one ordinary library item as imported JSON
- * attachments. Each activation owns a new writer lease: no device, restored
- * profile, or later activation ever edits an earlier writer's file. A lease
- * aggregates multiple reading sessions; retained files are intentionally not
- * compacted until a future protocol can prove they are safely replaceable.
+ * attachments. Each activation owns a new writer lease and each publication
+ * imports a new, immutable snapshot. Nothing edits an imported file while
+ * Zotero may be uploading it. A lease aggregates multiple reading sessions;
+ * retained snapshots are intentionally not compacted until a future protocol
+ * can prove they are safely replaceable.
  */
 (function (root, factory) {
   const api = factory();
@@ -77,6 +78,7 @@
     const writerID = "w-" + (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID() : Date.now().toString(36) + "-" + Zotero.Utilities.randomString(32));
     const queues = new Map(), ownFiles = new Map(), protectedRevisions = new Map(), downloads = new Map(), downloadAttempts = new Map();
+    let publication = 0;
     function queued(libraryID, task) {
       const previous = queues.get(libraryID) || Promise.resolve();
       const current = previous.catch(() => {}).then(task);
@@ -151,11 +153,19 @@
       return { journal: decodeJournal(text), path, text };
     }
     async function read(libraryID) {
-      const records = [], pending = [];
+      const records = [], pending = [], copies = new Map();
       for (const item of await attachmentItems(libraryID)) {
         try {
           const { journal } = await readAttachment(item);
-          for (const record of journal.records) records.push({ record: clone(record), sourceKey: item.key });
+          for (const record of journal.records) {
+            const identity = recordIdentity(record), previous = copies.get(identity) || [];
+            // Later immutable snapshots carry earlier owners. Identical copies
+            // are one logical record; differing clocks/content remain visible
+            // so the synchronizer can detect a real conflict or damaged record.
+            if (previous.some(value => sameRecord(value, record))) continue;
+            previous.push(record); copies.set(identity, previous);
+            records.push({ record: clone(record), sourceKey: item.key });
+          }
         }
         catch (error) { pending.push({ key: item.key, reason: error.message || String(error) }); }
       }
@@ -232,32 +242,25 @@
         if (item && before === JSON.stringify(records)) return { sourceKey: item.key, fingerprint: item.key + ":" + checksum(text) };
         const directory = PathUtils.join(Zotero.DataDirectory.dir, "reading-flow");
         await IOUtils.makeDirectory(directory, { ignoreExisting: true });
-        if (!item) {
-          const container = await getWritableContainer(libraryID);
-          const temporary = PathUtils.join(directory, "file-sync-" + libraryID + "-" + writerID + ".json");
-          await IOUtils.writeUTF8(temporary, text, { tmpPath: temporary + ".tmp" });
-          try {
-            item = await Zotero.Attachments.importFromFile({ file: temporary, parentItemID: container.id,
-              title: "Reading flow · 数据 · " + writerID.slice(0, 14), contentType: "application/json" });
-            item.attachmentSyncState = "to_upload"; await item.saveTx();
-            ownFiles.set(libraryID, item);
-          }
-          finally {
-            // Only our own temporary import source is removed; imported storage stays native.
-            if (typeof IOUtils.remove === "function") await IOUtils.remove(temporary, { ignoreAbsent: true }).catch(() => {});
-          }
-        }
-        else {
-          const path = await item.getFilePathAsync();
-          if (!path || !(await IOUtils.exists(path))) throw new Error("金字塔数据文件不在本机，本机草稿已保留。");
-          // Atomic file replacement precedes marking it dirty. A crash between these
-          // operations is also detected by Zotero's ordinary attachment mtime/hash scan.
-          await IOUtils.writeUTF8(path, text, { tmpPath: path + ".reading-flow-" + writerID + ".tmp" });
+        const container = await getWritableContainer(libraryID);
+        const snapshotID = writerID + "-" + (++publication).toString(36) + "-" + Zotero.Utilities.randomString(12);
+        const temporary = PathUtils.join(directory, "file-sync-" + libraryID + "-" + snapshotID + ".json");
+        await IOUtils.writeUTF8(temporary, text, { tmpPath: temporary + ".tmp" });
+        try {
+          // An imported attachment is immutable even during this activation.
+          // Zotero can finish syncing the old snapshot without racing an edit
+          // to its bytes, hash, mtime, or upload metadata.
+          item = await Zotero.Attachments.importFromFile({ file: temporary, parentItemID: container.id,
+            title: "Reading flow · 数据 · " + writerID.slice(0, 14), contentType: "application/json" });
           item.attachmentSyncState = "to_upload"; await item.saveTx();
+        }
+        finally {
+          // Only our own temporary import source is removed; imported storage stays native.
+          if (typeof IOUtils.remove === "function") await IOUtils.remove(temporary, { ignoreAbsent: true }).catch(() => {});
         }
         const reread = await readAttachment(item, { download: false });
         if (JSON.stringify(reread.journal.records) !== JSON.stringify(records)) throw new Error("金字塔数据文件读回校验失败，本机草稿已保留。");
-        protectedRevisions.set(libraryID, retained);
+        ownFiles.set(libraryID, item); protectedRevisions.set(libraryID, retained);
         return { sourceKey: item.key, fingerprint: item.key + ":" + checksum(text) };
       });
     }

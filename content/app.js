@@ -5,6 +5,7 @@
   let Core, state = null, bridge = null, item = null, readOnly = false, demo = false, syncVersions = [], syncBlocked = false;
   let selectedID = "root", revision = 0, savedRevision = 0, saving = null, saveTimeout = null;
   let actionBusy = false, configQueue = Promise.resolve(), lastHeight = 0, generation = 0;
+  let syncMode = "manual", syncCanRun = false, syncing = null, modeSaving = null;
   let boldSelection = null, framingVisible = false;
   const editorModels = new WeakMap();
   let manualHeight = null, lastManualMode = null, heightDrag = null;
@@ -22,6 +23,57 @@
     $("status").textContent = message;
     $("status").className = error ? "error" : "";
     resize();
+  }
+  function updateSyncControls() {
+    $("sync-now").disabled = !state || !syncCanRun || !!syncing;
+    $("sync-now").textContent = syncing ? "同步中…" : "同步";
+    $("sync-now").setAttribute("aria-busy", String(!!syncing));
+    $("sync-now").title = (syncMode === "interval" ? "每 30 分钟同步；点击立即同步" : "手动同步；点击立即同步") + "，编辑会自动保存在本机";
+    $("sync-mode").value = syncMode;
+    $("sync-mode").disabled = !!modeSaving || !bridge || typeof bridge.setSyncMode !== "function";
+  }
+  function setSyncMode(mode) {
+    syncMode = mode === "interval" ? "interval" : "manual";
+    updateSyncControls();
+    return syncMode;
+  }
+  async function syncNow() {
+    if (!state || !syncCanRun || syncing || typeof bridge?.syncNow !== "function") return;
+    const currentBridge = bridge, currentGeneration = generation;
+    const operation = {}; syncing = operation; updateSyncControls();
+    try {
+      await flushPendingSave();
+      if (currentGeneration !== generation) return;
+      const capturedRevision = revision, latest = clone(state);
+      status("同步中…");
+      const result = await currentBridge.syncNow(latest);
+      if (currentGeneration !== generation) return;
+      if (result?.cancelled) { status(result.message || "已取消同步"); return; }
+      const message = result?.message || "已请求同步";
+      status(message + (revision > capturedRevision ? "；新修改已留在本机，等待下次同步" : ""));
+    } catch (error) {
+      if (currentGeneration === generation) status(error.message || "同步失败，请稍后重试；本机编辑仍会保存。", true);
+    } finally {
+      if (syncing === operation) syncing = null;
+      updateSyncControls(); resize();
+    }
+  }
+  async function changeSyncMode() {
+    if (modeSaving || typeof bridge?.setSyncMode !== "function") { updateSyncControls(); return; }
+    const requested = $("sync-mode").value, currentBridge = bridge, currentGeneration = generation;
+    const operation = {}; modeSaving = operation; updateSyncControls();
+    try {
+      const result = await currentBridge.setSyncMode(requested);
+      if (currentGeneration === generation) {
+        setSyncMode(result?.mode || requested);
+        status(result?.message || (syncMode === "interval" ? "已改为每 30 分钟同步；编辑仍自动保存在本机。" : "已改为手动同步；编辑仍自动保存在本机。"));
+      }
+    } catch (error) {
+      if (currentGeneration === generation) status(error.message || "同步方式未能保存，请重试。", true);
+    } finally {
+      if (modeSaving === operation) modeSaving = null;
+      updateSyncControls(); resize();
+    }
   }
   function intrinsicSizing() {
     const toolsBox = $("tools").getBoundingClientRect();
@@ -131,7 +183,7 @@
       const result = await operation;
       if (capturedGeneration === generation) {
         savedRevision = capturedRevision;
-        const done = savedRevision >= revision ? result?.message || "已保存" : "待保存";
+        const done = savedRevision >= revision ? result?.message || "本机已保存" : "待保存";
         status(Core.getTimerView(state.timers[state.phase]).expired ? (state.phase === "inspection" ? "10" : "20") + " 分钟到了 · " + done : done);
       }
     }
@@ -407,7 +459,7 @@
     const demoItem = { libraryID: 1, key: "DEMO0001", title: "工具预览" }, key = "reading-flow-tools-v2-demo";
     let stored = null; try { stored = JSON.parse(localStorage.getItem(key) || "null"); } catch (_) {}
     let pyramidHeight = null; try { pyramidHeight = normalizeHeight(JSON.parse(localStorage.getItem("reading-flow-pyramid-height") || "null")); } catch (_) {}
-    return { item: demoItem, initialState: stored, demo: true, pyramidHeight, bridge: {
+    return { item: demoItem, initialState: stored, demo: true, pyramidHeight, syncCanRun: false, bridge: {
       savePyramidHeight(value) { localStorage.setItem("reading-flow-pyramid-height", JSON.stringify(value)); return value; },
       saveDraft: async value => localStorage.setItem(key, JSON.stringify(value)),
       flushState: value => localStorage.setItem(key, JSON.stringify(value)),
@@ -426,21 +478,25 @@
     endHeightDrag(false, false); generation++;
     manualHeight = normalizeHeight(config.pyramidHeight); lastManualMode = null;
     item = config.item; bridge = config.bridge; readOnly = !!config.readOnly || bridge.canEdit === false; demo = !!config.demo;
-    syncBlocked = !!config.syncConflict || !!config.syncPending;
+    syncCanRun = config.syncCanRun !== false && (config.syncCanRun === true || !readOnly) && typeof bridge.syncNow === "function";
+    setSyncMode(config.syncMode);
+    syncBlocked = !!config.syncConflict || !!config.syncPending && !config.syncCanEditLocal;
     syncVersions = (config.syncVersions || []).map(version => ({ ...version, state: Core.normalizeSession(version.state, item) }));
     state = incoming;
+    updateSyncControls();
     framingVisible = !!(state.framing.situation || state.framing.complication);
     revision = 0; savedRevision = 0; saving = null; selectedID = state.pyramid.id; expired.clear(); lastHeight = 0;
-    $("mode-label").textContent = config.syncConflict ? "选择同步版本" : config.syncPending ? "等待同步" : readOnly ? "只读" : demo ? "工具预览" : "";
+    $("mode-label").textContent = config.syncConflict ? "选择同步版本" : config.syncPending ? config.syncCanEditLocal && !readOnly ? "仅本机编辑" : "等待同步" : readOnly ? "只读" : demo ? "工具预览" : "";
     $("sync-area").hidden = !config.syncConflict || !syncVersions.length;
     $("sync-version").replaceChildren(...syncVersions.map(version => { const option = el("option"); option.value = version.id; option.textContent = version.label; return option; }));
     if (config.selectedSyncVersion) $("sync-version").value = config.selectedSyncVersion;
     $("sync-use").disabled = config.syncCanResolve === false || !!config.syncPending || typeof bridge.resolveSyncVersion !== "function";
-    $("more-toggle").hidden = typeof bridge.exportJSON !== "function" && typeof bridge.importJSON !== "function";
+    $("more-toggle").hidden = typeof bridge.exportJSON !== "function" && typeof bridge.importJSON !== "function" && typeof bridge.setSyncMode !== "function";
+    $("sync-mode-control").hidden = typeof bridge.setSyncMode !== "function";
     $("backup-export").hidden = typeof bridge.exportJSON !== "function";
     $("backup-import").hidden = typeof bridge.importJSON !== "function";
     $("backup-import").disabled = readOnly;
-    renderChecks(); renderDiagram(); status(config.syncConflict ? "检测到不同版本，请预览后选择；双方内容均已保留。" : config.syncPending ? "金字塔尚未同步完整，当前内容已保留。" : readOnly ? "当前文献库只读" : ""); updateTimer(); resize();
+    renderChecks(); renderDiagram(); status(config.syncConflict ? "检测到不同版本，请预览后选择；双方内容均已保留。" : config.syncPending ? config.syncCanEditLocal && !readOnly ? "现有草稿可在本机编辑；完成同步后再提交。" : "金字塔尚未同步完整，当前内容已保留。" : readOnly ? "当前文献库只读" : ""); updateTimer(); resize();
   }
   function loadConfig(config) {
     configQueue = configQueue.catch(() => {}).then(() => applyConfig(config));
@@ -450,7 +506,9 @@
   function initialize() {
     Core = window.ReadingFlowCore;
     if (!Core) { status("阅读工具未能载入", true); return; }
-    window.ReadingFlowApp = { flushPendingSave, hasPendingChanges: () => !!saving || savedRevision < revision, getState: () => state ? clone(state) : null, getSizing: () => clone(sizing), loadConfig, showNotice: message => status(message, true) };
+    window.ReadingFlowApp = { flushPendingSave, hasPendingChanges: () => !!saving || savedRevision < revision, getState: () => state ? clone(state) : null, getSizing: () => clone(sizing), loadConfig, setSyncMode, showNotice: message => status(message, true) };
+    $("sync-now").addEventListener("click", syncNow);
+    $("sync-mode").addEventListener("change", changeSyncMode);
     $("sync-version").addEventListener("change", () => {
       const version = syncVersions.find(version => version.id === $("sync-version").value); if (!version || !syncBlocked) return;
       state = clone(version.state); selectedID = state.pyramid.id; framingVisible = !!(state.framing.situation || state.framing.complication);

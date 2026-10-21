@@ -33,6 +33,141 @@ async function selectEditorText(editorLocator, start, end = start) {
   }, { start, end });
 }
 
+async function manualSyncRegression(context) {
+  const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message));
+  const root = page.locator('[data-node-id="root"] .node-text'), sync = page.locator('#sync-now');
+  const text = () => page.evaluate(() => window.ReadingFlowApp.getState().pyramid.text);
+  const mode = () => page.locator('#sync-mode').evaluate(select => select.value);
+  const chooseMode = value => page.locator('#sync-mode').evaluate((select, value) => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }, value);
+  try {
+    await page.goto(pathToFileURL(path.join(project, 'content', 'app.xhtml')).href);
+    await page.waitForFunction(() => window.ReadingFlowApp && window.ReadingFlowApp.getState());
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'MANUAL01', title: 'Manual synchronization' };
+      window.__syncCalls = []; window.__syncModes = []; window.__modeFailure = false;
+      const config = window.mockConfig(item, null);
+      config.syncCanRun = true;
+      config.bridge.setSyncMode = async mode => { if (window.__modeFailure) throw new Error('同步方式保存失败'); window.__syncModes.push(mode); return { mode }; };
+      config.bridge.syncNow = async state => {
+        window.__syncCalls.push(state);
+        if (window.__holdSync) { window.__syncBlocked = true; await new Promise(resolve => { window.__releaseSync = resolve; }); }
+        if (window.__syncFailure) throw new Error('模拟网络同步失败');
+        return { message: '同步完成', state: { pyramid: { text: '过期的服务端副本' } } };
+      };
+      window.__manualConfig = config;
+      await window.ReadingFlowApp.loadConfig(config);
+    });
+    await page.locator('#pyramid-toggle').click();
+    await root.fill('只需本机保存的第一段');
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    assert.equal(await page.evaluate(() => window.__savedState.pyramid.text), '只需本机保存的第一段');
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), 0);
+    assert.match(await page.locator('#status').textContent(), /本机已保存/);
+    await page.locator('#more-toggle').click();
+    assert.equal(await mode(), 'manual');
+    const saveCount = await page.evaluate(() => window.__saves.length);
+    await root.evaluate(editor => { window.__editingElement = editor; });
+    await chooseMode('interval');
+    await page.waitForFunction(() => window.__syncModes.length === 1 && !document.getElementById('sync-mode').disabled);
+    assert.match(await sync.getAttribute('title'), /每 30 分钟/);
+    await page.evaluate(() => window.ReadingFlowApp.setSyncMode('manual'));
+    assert.equal(await mode(), 'manual');
+    assert.equal(await root.evaluate(editor => editor === window.__editingElement), true);
+    assert.equal(await page.evaluate(() => window.__saves.length), saveCount);
+    assert.equal(await text(), '只需本机保存的第一段');
+    await page.evaluate(() => { window.__modeFailure = true; });
+    await chooseMode('interval');
+    await page.waitForFunction(() => document.getElementById('status').textContent === '同步方式保存失败');
+    assert.equal(await mode(), 'manual');
+    await page.evaluate(() => { window.__modeFailure = false; });
+    pass('edits autosave locally without sync and manual/30-minute preferences never replace the editing DOM or save a note');
+
+    await page.evaluate(() => { window.__holdSave = true; window.__holdSync = true; });
+    await root.fill('同步按钮前的编辑');
+    await sync.click(); await page.waitForFunction(() => window.__saveBlocked);
+    await root.fill('等待本机保存期间继续快速输入');
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), 0);
+    await page.evaluate(() => { window.__holdSave = false; window.__releaseSave(); });
+    await page.waitForFunction(() => window.__syncBlocked);
+    assert.equal(await page.evaluate(() => window.__syncCalls[0].pyramid.text), '等待本机保存期间继续快速输入');
+    assert.equal(await sync.isDisabled(), true);
+    await sync.evaluate(button => button.click());
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), 1);
+    assert.equal(await root.getAttribute('contenteditable'), 'true');
+    await root.fill('上传期间继续输入的新内容');
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    await page.evaluate(() => { window.__holdSync = false; window.__releaseSync(); });
+    await page.waitForFunction(() => !document.getElementById('sync-now').disabled);
+    assert.equal(await text(), '上传期间继续输入的新内容');
+    assert.equal(await page.evaluate(() => window.__savedState.pyramid.text), '上传期间继续输入的新内容');
+    assert.match(await page.locator('#status').textContent(), /新修改已留在本机，等待下次同步/);
+    assert.equal(await page.evaluate(() => window.ReadingFlowApp.hasPendingChanges()), false);
+    pass('manual sync waits for the latest local save, rejects duplicate clicks and preserves fast typing during upload');
+
+    await page.evaluate(() => { window.__syncFailure = true; }); await sync.click();
+    await page.waitForFunction(() => !document.getElementById('sync-now').disabled);
+    assert.equal(await page.locator('#status').textContent(), '模拟网络同步失败');
+    assert.equal(await text(), '上传期间继续输入的新内容');
+    const syncCount = await page.evaluate(() => window.__syncCalls.length);
+    await page.evaluate(() => { window.__syncFailure = false; window.__failSave = true; });
+    await root.fill('本机保存失败仍保留的输入'); await sync.click();
+    await page.waitForFunction(() => !document.getElementById('sync-now').disabled);
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), syncCount);
+    assert.match(await page.locator('#status').textContent(), /模拟保存失败/);
+    await page.evaluate(async () => { window.__failSave = false; await window.ReadingFlowApp.flushPendingSave(); });
+    pass('sync failures retain local text and failed local saves do not upload or report success');
+
+    await page.evaluate(async () => {
+      const config = { ...window.__manualConfig, initialState: window.ReadingFlowApp.getState(), readOnly: true, syncPending: true, syncCanRun: true };
+      config.bridge.canEdit = false; await window.ReadingFlowApp.loadConfig(config);
+    });
+    assert.equal(await root.getAttribute('contenteditable'), 'false'); assert.equal(await sync.isDisabled(), false);
+    await sync.click(); await page.waitForFunction(() => !document.getElementById('sync-now').disabled);
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), syncCount + 1);
+    await page.evaluate(async () => {
+      const config = { ...window.__manualConfig, initialState: window.ReadingFlowApp.getState(), syncPending: true, syncCanEditLocal: true, syncCanRun: true };
+      config.bridge.canEdit = true; await window.ReadingFlowApp.loadConfig(config);
+    });
+    assert.equal(await root.getAttribute('contenteditable'), 'true');
+    assert.equal(await page.locator('#mode-label').textContent(), '仅本机编辑');
+    assert.match(await page.locator('#status').textContent(), /现有草稿可在本机编辑；完成同步后再提交/);
+    await root.fill('文件同步未完成时继续编辑的本机草稿');
+    await page.evaluate(() => window.ReadingFlowApp.flushPendingSave());
+    assert.equal(await page.evaluate(() => window.__savedState.pyramid.text), '文件同步未完成时继续编辑的本机草稿');
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), syncCount + 1);
+    await sync.click(); await page.waitForFunction(() => !document.getElementById('sync-now').disabled);
+    assert.equal(await page.evaluate(() => window.__syncCalls.length), syncCount + 2);
+    assert.equal(await page.evaluate(() => window.__syncCalls.at(-1).pyramid.text), '文件同步未完成时继续编辑的本机草稿');
+    assert.equal(await text(), '文件同步未完成时继续编辑的本机草稿');
+    pass('a usable existing draft remains editable and autosaves locally while pending files wait for an explicit sync retry');
+    await page.evaluate(async () => {
+      const config = { ...window.__manualConfig, initialState: window.ReadingFlowApp.getState(), readOnly: true, syncCanRun: false };
+      await window.ReadingFlowApp.loadConfig(config);
+    });
+    assert.equal(await sync.isDisabled(), true);
+    pass('pending data can retry synchronization while an actually read-only library cannot initiate it');
+
+    await page.evaluate(async () => {
+      window.__manualConfig.bridge.canEdit = true;
+      await window.ReadingFlowApp.loadConfig({ ...window.__manualConfig, initialState: window.ReadingFlowApp.getState() });
+      window.__holdSync = true; window.__syncBlocked = false; window.__syncFailure = true;
+    });
+    await sync.click(); await page.waitForFunction(() => window.__syncBlocked);
+    await page.evaluate(async () => {
+      const item = { libraryID: 1, key: 'MANUAL02', title: 'Another note during upload' };
+      const config = window.mockConfig(item, null);
+      config.initialState = window.ReadingFlowCore.createSession(item); config.initialState.pyramid.text = '新条目的最新内容';
+      await window.ReadingFlowApp.loadConfig(config);
+      window.ReadingFlowApp.showNotice('新条目的提示');
+      window.__holdSync = false; window.__releaseSync();
+    });
+    await page.waitForFunction(() => document.getElementById('sync-now').getAttribute('aria-busy') === 'false');
+    assert.equal(await text(), '新条目的最新内容');
+    assert.equal(await page.locator('#status').textContent(), '新条目的提示');
+    pass('a finishing sync from the previous note cannot overwrite the next note or its status');
+  } finally { await page.close(); }
+}
+
 async function framingBoldRegression(context) {
   const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message)); page.on('dialog', dialog => dialog.accept());
   const state = () => page.evaluate(() => window.ReadingFlowApp.getState());
@@ -550,6 +685,7 @@ async function manualHeightRegression(browser) {
     assert.equal((await sizing()).manualHeight, large.manualHeight);
     assert.equal(await page.evaluate(() => window.requested), large.requestedHeight);
     assert.ok(await page.locator('#native').evaluate(node => node.getBoundingClientRect().height >= 80));
+    await frame.waitForFunction(() => document.documentElement.scrollHeight <= innerHeight);
     assert.equal(await frame.evaluate(() => document.documentElement.scrollHeight > innerHeight), false);
     await page.evaluate(() => { document.getElementById('panel').style.display='none'; }); await page.waitForTimeout(150);
     assert.equal((await sizing()).manualHeight, large.manualHeight);
@@ -879,6 +1015,7 @@ async function manualHeightRegression(browser) {
     assert.equal(await page.locator('#sync-area').isVisible(), false);
     assert.equal(await page.evaluate(() => window.ReadingFlowApp.getState().pyramid.text), '电脑 B 保留的观点');
     pass('incomplete synchronized data preserves the current tree and prevents premature writes');
+    await manualSyncRegression(context);
     await boldEditingRegression(context);
     await framingBoldRegression(context);
     await fontSizingRegression(context);

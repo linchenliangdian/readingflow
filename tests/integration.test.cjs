@@ -8,7 +8,7 @@ const { webcrypto } = require('node:crypto');
 const read = name => fs.readFileSync(path.join(__dirname, '..', 'content', name), 'utf8');
 
 function harness({ scanDrafts = false, coldTools = false } = {}) {
-  const transportRecords = new Map(), transportWrites = [];
+  const transportRecords = new Map(), transportWrites = [], nativeSyncCalls = [], intervalTimers = new Map();
   let currentFileStore = null;
   const files = new Map(), prefs = new Map(), items = new Map(), notes = [], menus = new Map(), writes = [], pickerResponses = [], pickerRequests = [], errors = [], shutdownListeners = [], debugMessages = [], dbCalls = [], resizeObservers = [], observers = new Map(), noteWrites = [], imagePosts = [];
   const libraries = new Map([[1, { editable: true }]]), inFlight = new Map(), maximumInFlight = new Map(), blockedReads = new Map();
@@ -108,7 +108,11 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
   const windowListeners = new Map();
   const host = {
     document, closed: false, CustomEvent: class {},
-    setTimeout, clearTimeout, setInterval, clearInterval,
+    setTimeout(callback, delay, ...args) {
+      if (delay !== 1800000) return setTimeout(callback, delay, ...args);
+      const id = {}; intervalTimers.set(id, () => callback(...args)); return id;
+    },
+    clearTimeout(id) { if (!intervalTimers.delete(id)) clearTimeout(id); }, setInterval, clearInterval,
     ResizeObserver: class {
       constructor(callback) { this.callback = callback; this.targets = new Set(); this.disconnected = false; resizeObservers.push(this); }
       observe(node) { this.targets.add(node); } disconnect() { this.disconnected = true; this.targets.clear(); }
@@ -186,6 +190,13 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
       return sectionID;
     }, unregisterSection(id) { assert.equal(id, sectionID); section = null; for (const nav of [libraryNav, readerNav]) { for (const button of nav.buttons) if (button.dataset.pane === id) button.remove(); nav.buttons = nav.buttons.filter(button => button.dataset.pane !== id); } } },
     Reader: { _readers: [], _registeredListeners: [{ handler: () => {}, type: 'renderToolbar', pluginID: 'other-plugin' }], registerEventListener(type, handler, pluginID) { this._registeredListeners.push({ type, handler, pluginID }); }, getByTabID() { return null; } },
+    Sync: { Runner: { backgroundSync: false, syncImplementation: null, addError() {}, async sync(options = {}) {
+      nativeSyncCalls.push(options); this.backgroundSync = !!options.background;
+      try {
+        await Zotero.Notifier.trigger('start', 'sync');
+        return this.syncImplementation ? await this.syncImplementation(options) : true;
+      } finally { await Zotero.Notifier.trigger('finish', 'sync'); this.backgroundSync = false; }
+    } } },
     Notifier: {
       registerObserver(observer, types, name) { const id = nextObserverID++; observers.set(id, { observer, types, name }); return id; }, unregisterObserver(id) { observers.delete(id); },
       async trigger(action, type, ids = [], extraData = {}) { await Promise.all([...observers.values()].filter(({ types }) => types.includes(type)).map(({ observer }) => observer.notify(action, type, ids, extraData))); }
@@ -193,7 +204,7 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
   };
   const IOUtils = {
     makeDirectory: async () => {}, exists: async name => files.has(name) || scanDrafts && [...files.keys()].some(path => path.startsWith(name + '/')), stat: async name => ({ size: Buffer.byteLength(files.get(name) || '', 'utf8') }),
-    async readUTF8(name) { const barrier = blockedReads.get(name); if (barrier) await barrier; if (!files.has(name)) throw new Error('ENOENT'); return files.get(name); },
+    async readUTF8(name) { const barrier = blockedReads.get(name); if (barrier) { barrier.started(); await barrier.promise; } if (!files.has(name)) throw new Error('ENOENT'); return files.get(name); },
     async read(name) { if (!files.has(name)) throw new Error('ENOENT'); return new Uint8Array(Buffer.from(files.get(name), 'utf8')); },
     async write(name, content, options) { assert.ok(ArrayBuffer.isView(content), 'note relink backups use raw bytes'); return this.writeUTF8(name, Buffer.from(content).toString('utf8'), options); },
     async writeUTF8(name, content, options) {
@@ -234,10 +245,11 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
   vm.runInContext(read('integration.js'), context);
   const identity = item => ({ libraryID: item.libraryID, key: item.key, title: item.getField('title') });
   const draftName = item => 'D:/fake-zotero-data/reading-flow/' + item.libraryID + '-' + item.key + '.json';
-  return { files, prefs, items, notes, transportRecords, transportWrites, get fileStore() { return currentFileStore; }, proseNotes: () => notes.filter(note => !context.ReadingFlowSync?.decodeNote(note.html)), menus, writes, pickerResponses, pickerRequests, libraries, maximumInFlight, errors, Zotero, host, parent, other, attachment, identity, draftName, originalActiveEditor, shutdownListeners, debugMessages, dbCalls, resizeObservers, observers, noteWrites, imagePosts, libraryPane, libraryNav, readerContext, nativeNoteRenderResult, core: context.ReadingFlowCore, sync: context.ReadingFlowSync, getSection: () => section,
+  return { files, prefs, items, notes, transportRecords, transportWrites, nativeSyncCalls, intervalTimers, get fileStore() { return currentFileStore; }, proseNotes: () => notes.filter(note => !context.ReadingFlowSync?.decodeNote(note.html)), menus, writes, pickerResponses, pickerRequests, libraries, maximumInFlight, errors, Zotero, host, parent, other, attachment, identity, draftName, originalActiveEditor, shutdownListeners, debugMessages, dbCalls, resizeObservers, observers, noteWrites, imagePosts, libraryPane, libraryNav, readerContext, nativeNoteRenderResult, core: context.ReadingFlowCore, sync: context.ReadingFlowSync, getSection: () => section,
     start: (version = '1.0.0') => context.ReadingFlowIntegration.start({ id: 'reading-flow@test', version }), stop: () => context.ReadingFlowIntegration.stop(),
     failWrite: () => { failNextWrite = true; }, failDraftWrite: (item = parent) => { failWritePath = draftName(item); }, durable: (item = parent) => JSON.parse(files.get(draftName(item))),
     setNow(value) { context.readingFlowTestNow = value; vm.runInContext('Date.now = () => readingFlowTestNow', context); },
+    firePeriodicSync() { const [id, callback] = intervalTimers.entries().next().value || []; assert.ok(callback, 'a 30-minute check must be scheduled'); intervalTimers.delete(id); callback(); },
     restoreNote(saved) { const note = new Note('note'); Object.assign(note, { id: saved.id, key: saved.key, libraryID: saved.libraryID, parentID: saved.parentID, html: saved.html, tags: [...saved.tags], deleted: saved.deleted }); items.set(note.id, note); notes.push(note); nextID = Math.max(nextID, note.id + 1); return note; },
     async clickRail(kind = 'library') {
       const handle = Zotero.ReadingFlow.inspect(host).find(panel => panel.kind === kind), event = handle.button.click(); assert.equal(event.prevented, true); assert.equal(event.stopped, true);
@@ -245,7 +257,7 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
       for (let i = 0; i < 100 && !handle.config && !errors.length; i++) await new Promise(resolve => setTimeout(resolve, 2));
       if (errors.length) throw errors.at(-1); assert.ok(handle.config, 'rail click must finish native editor configuration'); return handle;
     },
-    blockRead(item) { let resolve; const promise = new Promise(done => { resolve = done; }); blockedReads.set(draftName(item), promise); return () => { blockedReads.delete(draftName(item)); resolve(); }; },
+    blockRead(item) { let resolve, started; const promise = new Promise(done => { resolve = done; }), entered = new Promise(done => { started = done; }); blockedReads.set(draftName(item), { promise, started }); const release = () => { blockedReads.delete(draftName(item)); resolve(); }; release.started = entered; return release; },
     activateReader(item = parent) { host.Zotero_Tabs.select('reader-test'); readerNav.container.item = item; updateSection(item, 'reader'); },
     selectNativeNote(note) { librarySelection = note; libraryNav.renderDefaultStatus(); return libraryPane.renderNoteEditor(note); },
     clearSelection() { librarySelection = libraryNav.container.item = null; updateSection(null, 'library'); }, unloadHost() { windowListeners.get('unload')?.(); },
@@ -280,6 +292,11 @@ function transferNotes(source, target, filter = () => true) {
     }
   }
   return changed;
+}
+
+async function publishAndTransferNotes(source, target, filter = () => true) {
+  await source.Zotero.ReadingFlow.syncNow();
+  return transferNotes(source, target, filter);
 }
 
 async function waitUntil(predicate, message) {
@@ -339,7 +356,7 @@ test('standalone notes keep separate pyramid, formatting, framing, and timer dra
   await assert.rejects(() => bridgeA.exportNote(stateA), /切换/); assert.throws(() => bridgeA.insertPyramid({ pngDataURL: 'data:image/png;base64,AAAA', width: 10, height: 10 }), /切换/);
   assert.equal(first.durable(a).pyramid.text, 'A conclusion'); assert.equal(a.html, '<p>Independent A</p>'); assert.equal(b.html, '<p>Independent B</p>'); await first.stop();
   const cold = coldHarness(first); await cold.start(); t.after(() => cold.stop()); await cold.host.ZoteroPane.selectItem(a.id); const reopened = await cold.clickRail();
-  assert.equal(reopened.note, cold.items.get(a.id)); assert.equal(reopened.editor.item.key, a.key); assert.equal(cold.proseNotes().length, 2); assert.equal(cold.writes.length, 0);
+  assert.equal(reopened.note, cold.items.get(a.id)); assert.equal(reopened.editor.item.key, a.key); assert.equal(cold.proseNotes().length, 2); assert.equal(cold.transportWrites.length, 0);
   const restored = JSON.parse(JSON.stringify(reopened.getState())); assert.equal(restored.pyramid.text, 'A conclusion'); assert.deepEqual(restored.pyramid.boldRanges, [{ start: 0, end: 1 }]);
   assert.equal(restored.framing.situation, 'A background'); assert.equal(restored.framing.complication, 'A conflict'); assert.deepEqual(restored.timers, first.durable(a).timers);
   assert.equal(restored.noteKey, a.key); assert.equal(restored.item.key, a.key);
@@ -527,7 +544,7 @@ test('cold rail reopen keeps a correctly bound note whose mutable sidebar tags w
   const cold = coldHarness(first), original = cold.items.get(opened.note.id); await cold.start(); t.after(() => cold.stop());
   const reopened = await cold.clickRail();
   assert.equal(reopened.note, original); assert.equal(cold.proseNotes().length, 1); assert.equal(original.html, '<p>Keep untagged native prose.</p>');
-  assert.deepEqual(original.tags, []); assert.equal(cold.writes.length, 0); assert.equal(reopened.toolsWindow.ReadingFlowApp.notice, '');
+  assert.deepEqual(original.tags, []); assert.equal(cold.transportWrites.length, 0); assert.equal(reopened.toolsWindow.ReadingFlowApp.notice, '');
 });
 
 test('opening a legacy reading note removes only its automatic labels and keeps the saved association', async t => {
@@ -546,7 +563,7 @@ test('legacy tag recovery persists a note key before removing its labels and pre
     const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'My tag']; note.setNote('<p>Legacy body</p>'); await note.saveTx();
     if (fail) h.failDraftWrite(); await h.start(); t.after(() => h.stop());
     if (fail) { await assert.rejects(h.clickRail(), /atomic-write/); assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'My tag']); }
-    else { const handle = await h.clickRail(); assert.equal(handle.note, note); assert.equal(h.durable().noteKey, note.key); assert.deepEqual(note.tags, ['My tag']); }
+    else { const handle = await h.clickRail(); assert.equal(handle.note, note); assert.equal(h.durable().noteKey, note.key); await h.Zotero.ReadingFlow.syncNow(); assert.deepEqual(note.tags, ['My tag']); }
     assert.equal(note.html, '<p>Legacy body</p>'); assert.equal(h.proseNotes().length, 1);
   });
 });
@@ -568,7 +585,7 @@ test('a failed legacy tag save preserves its original tags and leaves the native
   const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'Personal']; note.setNote('<p>Original body</p>'); await note.saveTx();
   const save = note.save.bind(note); let failed = false;
   note.save = async function () { if (!failed && !this.hasTag('Reading Flow · sidebar')) { failed = true; throw new Error('Simulated legacy tag save failure'); } return save(); };
-  await h.start(); t.after(() => h.stop()); const handle = await h.Zotero.ReadingFlow.openItem(h.parent.id);
+  await h.start(); t.after(() => h.stop()); const handle = await h.Zotero.ReadingFlow.openItem(h.parent.id); await h.Zotero.ReadingFlow.syncNow();
   assert.equal(handle.note, note); assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'Personal']); assert.equal(note.html, '<p>Original body</p>');
   assert.equal(h.durable().noteKey, note.key); assert.equal(h.proseNotes().length, 1); assert.equal(h.errors.length, 1); assert.match(h.errors[0].message, /legacy tag save failure/);
 });
@@ -586,7 +603,7 @@ test('cold rail reopen replaces a trashed binding while backing up the exact dra
   const backups = [...cold.files].filter(([name]) => name.includes('.before-note-relink-')); assert.equal(backups.length, 1); assert.equal(backups[0][1], oldDraft);
   assert.match(recovered.toolsWindow.ReadingFlowApp.notice, /回收站.*已建立新笔记.*保留/);
   const next = coldHarness(cold); await cold.stop(); await next.start(); t.after(() => next.stop());
-  const reopened = await next.clickRail(); assert.equal(reopened.note.key, recovered.note.key); assert.equal(next.proseNotes().length, 2); assert.equal(next.writes.length, 0);
+  const reopened = await next.clickRail(); assert.equal(reopened.note.key, recovered.note.key); assert.equal(next.proseNotes().length, 2); assert.equal(next.transportWrites.length, 0);
 });
 
 test('repeated hot rail clicks recover a trashed note once and never flush a stale native buffer into the trash', async t => {
@@ -623,7 +640,7 @@ test('a native commit failure after the draft write preserves a recoverable key 
 test('a failed sync publication retains legacy discovery tags for another device', async t => {
   const h = harness(), note = new h.Zotero.Item('note'); note.libraryID = 1; note.parentID = h.parent.id; note.tags = ['Reading Flow', 'Reading Flow · sidebar', 'Personal']; note.setNote('<p>Original body</p>'); await note.saveTx();
   await h.start(); t.after(() => h.stop()); h.fileStore.write = async () => { throw new Error('Simulated sync file failure'); };
-  await assert.rejects(h.Zotero.ReadingFlow.openItem(h.parent.id), /sync file failure/);
+  await h.Zotero.ReadingFlow.openItem(h.parent.id); assert.equal(h.errors.length, 0); await h.Zotero.ReadingFlow.syncNow(); assert.ok(h.errors.some(error => /sync file failure/.test(error.message)));
   assert.deepEqual(note.tags, ['Reading Flow', 'Reading Flow · sidebar', 'Personal']); assert.equal(note.html, '<p>Original body</p>'); assert.equal(h.durable().noteKey, note.key); assert.equal(h.proseNotes().length, 1);
 });
 
@@ -897,18 +914,18 @@ test('pyramid display height persists across items and cold reopening without en
 test('a second device with no plugin files reopens the synced editable pyramid and binds the same native note', async t => {
   const a = harness(); await a.start(); t.after(() => a.stop()); const first = await a.clickRail(), state = first.getState();
   state.pyramid.text = 'Portable editable reasoning'; state.pyramid.boldRanges = [{ start: 0, end: 8 }]; state.framing.situation = 'Shared background';
-  await first.config.bridge.flushState(state); const b = harness(); transferNotes(a, b); assert.equal(b.files.size, 0); assert.equal(b.prefs.size, 0);
+  await first.config.bridge.flushState(state); const b = harness(); await publishAndTransferNotes(a, b); assert.equal(b.files.size, 0); assert.equal(b.prefs.size, 0);
   await b.start(); t.after(() => b.stop()); const reopened = await b.clickRail();
   assert.equal(reopened.getState().pyramid.text, 'Portable editable reasoning'); assert.deepEqual(JSON.parse(JSON.stringify(reopened.getState().pyramid.boldRanges)), [{ start: 0, end: 8 }]);
   assert.equal(reopened.getState().framing.situation, 'Shared background'); assert.equal(reopened.note.key, first.note.key); assert.equal(b.proseNotes().length, 1);
   assert.equal(reopened.config.syncConflict, false); assert.equal(reopened.config.bridge.canEdit, true);
 });
 
-test('an item notification refreshes a clean visible pyramid when a newer device version arrives', async t => {
+test('manual synchronization refreshes a clean visible pyramid while item notifications leave it alone', async t => {
   const a = harness(); await a.start(); t.after(() => a.stop()); const shown = await a.clickRail(); shown.getState().pyramid.text = 'Initial A'; await shown.config.bridge.flushState(shown.getState());
-  const b = harness(); transferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'New B version'; await other.config.bridge.flushState(other.getState());
-  const before = shown.config, ids = transferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF));
-  await a.emitItemChange(ids, 'add'); await waitUntil(() => shown.config !== before, 'visible pyramid should refresh after synced records arrive');
+  const b = harness(); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'New B version'; await other.config.bridge.flushState(other.getState());
+  const before = shown.config, ids = await publishAndTransferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF));
+  await a.emitItemChange(ids, 'add'); await new Promise(resolve => setTimeout(resolve, 280)); assert.equal(shown.config, before); await a.Zotero.ReadingFlow.syncNow(); await waitUntil(() => shown.config !== before, 'an explicit check should refresh the visible pyramid');
   assert.equal(shown.getState().pyramid.text, 'New B version'); assert.equal(shown.config.syncConflict, false); assert.equal(shown.note.key, other.note.key);
   const writes = a.noteWrites.length, refreshed = shown.config; await a.emitItemChange(ids); await new Promise(resolve => setTimeout(resolve, 320));
   assert.equal(shown.config, refreshed); assert.equal(a.noteWrites.length, writes, 'identical notifications must not create a sync write loop');
@@ -924,30 +941,30 @@ test('expiry during publication leaves a clean canonical cache that a causal rem
     await Promise.resolve(); a.setNow(now + a.core.DURATIONS.inspection + 1); expiredDuringPublication = true;
     return result;
   };
-  await shown.config.bridge.flushState(state); assert.equal(expiredDuringPublication, true);
+  await shown.config.bridge.flushState(state); assert.equal(expiredDuringPublication, false); await a.Zotero.ReadingFlow.syncNow(); assert.equal(expiredDuringPublication, true);
   const running = [...a.transportRecords.values()].find(value => value.record.state.pyramid.text === 'Saved before expiry').record;
   assert.equal(running.state.timers.inspection.status, 'running'); assert.equal(running.hash, a.sync.stateHash(running.state));
   const cache = a.durable(); assert.equal(cache.timers.inspection.status, 'expired'); assert.equal(cache.readingFlowSync.pending, false);
   assert.notEqual(a.sync.stateHash(cache), running.hash, 'expiry occurred after the published snapshot was captured');
   assert.equal(cache.readingFlowSync.stateHash, a.sync.stateHash(cache), 'a successful publication baselines the exact canonical cache that reaches disk');
-  const b = harness(); b.setNow(now + b.core.DURATIONS.inspection + 1); transferNotes(a, b); await b.start(); t.after(() => b.stop());
+  const b = harness(); b.setNow(now + b.core.DURATIONS.inspection + 1); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop());
   const remote = await b.clickRail(); remote.getState().pyramid.text = 'Causal remote edit after expiry'; await remote.config.bridge.flushState(remote.getState());
-  const before = shown.config, ids = transferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF));
-  await a.emitItemChange(ids); await waitUntil(() => shown.config !== before, 'the clean expired cache should accept its causal remote descendant');
+  const before = shown.config, ids = await publishAndTransferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF));
+  await a.emitItemChange(ids); await a.Zotero.ReadingFlow.syncNow(); await waitUntil(() => shown.config !== before, 'the clean expired cache should accept its causal remote descendant');
   assert.equal(shown.config.syncPending, false); assert.equal(shown.config.syncConflict, false); assert.equal(shown.config.bridge.canEdit, true);
   assert.equal(shown.getState().pyramid.text, 'Causal remote edit after expiry'); assert.equal(shown.getState().timers.inspection.status, 'expired');
   assert.equal(a.errors.length, 0); assert.equal(b.errors.length, 0);
 });
 
 test('ordinary read-only draft writes retain the published baseline and preserve local edits against a remote descendant', async t => {
-  const a = harness(); await a.start(); const shown = await a.clickRail(); shown.getState().pyramid.text = 'Published baseline'; await shown.config.bridge.flushState(shown.getState());
-  const baseline = a.durable().readingFlowSync.stateHash, b = harness(); transferNotes(a, b); await b.start(); t.after(() => b.stop());
+  const a = harness(); await a.start(); const shown = await a.clickRail(); shown.getState().pyramid.text = 'Published baseline'; await shown.config.bridge.flushState(shown.getState()); await a.Zotero.ReadingFlow.syncNow();
+  const baseline = a.durable().readingFlowSync.stateHash, b = harness(); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop());
   const remote = await b.clickRail(); remote.getState().pyramid.text = 'Remote descendant'; await remote.config.bridge.flushState(remote.getState());
   await a.stop(); a.libraries.get(1).editable = false; await a.start(); t.after(() => a.stop()); const readOnly = await a.clickRail();
   assert.equal(readOnly.readOnly, true); readOnly.getState().pyramid.text = 'Unpublished local reasoning'; await readOnly.config.bridge.saveDraft(readOnly.getState());
   const draft = a.durable(); assert.equal(draft.readingFlowSync.stateHash, baseline); assert.notEqual(a.sync.stateHash(draft), baseline);
   assert.equal(draft.readingFlowSync.pending, false, 'the raw-content comparison must still identify this ordinary dirty draft');
-  transferNotes(b, a); const loaded = await a.sync.create({ Zotero: a.Zotero, core: a.core, fileStore: a.fileStore }).load(a.identity(a.parent), draft);
+  await publishAndTransferNotes(b, a); const loaded = await a.sync.create({ Zotero: a.Zotero, core: a.core, fileStore: a.fileStore }).load(a.identity(a.parent), draft);
   assert.equal(loaded.pending, false); assert.equal(loaded.conflict, true); assert.equal(loaded.state.pyramid.text, 'Unpublished local reasoning');
   assert.deepEqual(new Set(loaded.versions.map(version => version.state.pyramid.text)), new Set(['Unpublished local reasoning', 'Remote descendant']));
   assert.equal(a.durable().pyramid.text, 'Unpublished local reasoning'); assert.equal(a.errors.length, 0);
@@ -955,11 +972,11 @@ test('ordinary read-only draft writes retain the published baseline and preserve
 
 test('a remote arrival preserves unsaved typing as a local conflict and explicit selection resolves it', async t => {
   const a = harness(); await a.start(); t.after(() => a.stop()); const shown = await a.clickRail(); shown.getState().pyramid.text = 'Original'; await shown.config.bridge.flushState(shown.getState());
-  const b = harness(); transferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'Incoming B'; await other.config.bridge.flushState(other.getState());
+  const b = harness(); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'Incoming B'; await other.config.bridge.flushState(other.getState());
   const app = shown.toolsWindow.ReadingFlowApp, before = shown.config, bridge = before.bridge; app.state.pyramid.text = 'Unsent A typing'; app.dirty = true;
   app.flushPendingSave = async () => { if (!app.dirty) return; app.dirty = false; await bridge.flushState(app.state); };
-  const ids = transferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF)); await a.emitItemChange(ids);
-  await waitUntil(() => shown.config !== before, 'a dirty local editor must surface a conflict after the remote arrival');
+  const ids = await publishAndTransferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF)); await a.emitItemChange(ids); assert.equal(shown.config, before); await a.Zotero.ReadingFlow.syncNow();
+  await waitUntil(() => shown.config !== before, 'an explicit check must preserve both genuine concurrent edits');
   assert.equal(shown.config.syncConflict, true); assert.equal(shown.config.bridge.canEdit, false); assert.equal(a.durable().pyramid.text, 'Unsent A typing');
   assert.deepEqual(new Set(shown.config.syncVersions.map(version => version.state.pyramid.text)), new Set(['Incoming B', 'Unsent A typing']));
   const chosen = shown.config.syncVersions.find(version => version.state.pyramid.text === 'Incoming B'); await shown.config.bridge.resolveSyncVersion(chosen.id);
@@ -973,36 +990,36 @@ test('stopping the plugin cancels pending sync refreshes and unregisters its obs
   await h.emitItemChange([123]); await new Promise(resolve => setTimeout(resolve, 280)); assert.equal(handle.config, before); assert.equal(handle.panel.isConnected, false);
 });
 
-test('background migration publishes unopened legacy drafts once and preserves their native prose binding', async t => {
+test('manual synchronization publishes unopened legacy drafts once and preserves their native prose binding', async t => {
   const h = harness({ scanDrafts: true }), prose = await standaloneNote(h, 'Keep this existing native body'); prose.parentID = h.parent.id;
   const legacy = h.core.createSession(h.identity(h.parent)); legacy.noteKey = prose.key; legacy.pyramid.text = 'Unopened legacy reasoning'; h.files.set(h.draftName(h.parent), JSON.stringify(legacy));
-  await h.start(); t.after(() => h.stop()); await waitUntil(() => h.files.has(h.draftName(h.parent)) && h.durable().readingFlowSync?.format === h.sync.FORMAT, 'legacy draft should migrate without opening its sidebar');
+  await h.start(); t.after(() => h.stop()); await new Promise(resolve => setTimeout(resolve, 40)); assert.equal(h.transportWrites.length, 0); assert.equal(h.files.get(h.draftName(h.parent)), JSON.stringify(legacy)); await h.Zotero.ReadingFlow.syncNow(); await waitUntil(() => h.durable().readingFlowSync?.format === h.sync.FORMAT, 'an explicit check should migrate unopened drafts');
   assert.equal(h.Zotero.ReadingFlow.inspect(h.host).some(handle => handle.config), false); assert.equal(h.proseNotes().length, 1); assert.equal(prose.html, '<p>Keep this existing native body</p>');
   const head = [...h.transportRecords.values()].find(value => value.record.ownerKey === h.parent.key); assert.ok(head); const migrated = head.record.state; assert.equal(migrated.pyramid.text, legacy.pyramid.text); assert.equal(migrated.noteKey, prose.key); assert.equal(h.notes.filter(note => h.sync.decodeNote(note.html)).length, 0);
   await h.stop(); const cold = harness({ scanDrafts: true }); for (const [path, content] of h.files) cold.files.set(path, content); for (const [key, value] of h.prefs) cold.prefs.set(key, value); transferNotes(h, cold);
-  await cold.start(); t.after(() => cold.stop()); await new Promise(resolve => setTimeout(resolve, 40)); assert.equal(cold.noteWrites.length, 0); assert.equal(cold.writes.length, 0);
+  await cold.start(); t.after(() => cold.stop()); await new Promise(resolve => setTimeout(resolve, 40)); assert.equal(cold.noteWrites.length, 0); assert.equal(cold.transportWrites.length, 0);
 });
 
-test('background migration skips read-only and missing-note drafts and preserves corrupt source files', async t => {
+test('manual migration skips read-only and missing-note drafts and preserves corrupt source files', async t => {
   for (const kind of ['read-only', 'missing-note', 'corrupt']) await t.test(kind, async t => {
     const h = harness({ scanDrafts: true }), legacy = h.core.createSession(h.identity(h.parent)); legacy.pyramid.text = 'Keep unopened local content';
     if (kind === 'read-only') h.libraries.get(1).editable = false;
     if (kind === 'missing-note') legacy.noteKey = 'MISSING1';
     const raw = kind === 'corrupt' ? '{broken-json' : JSON.stringify(legacy); h.files.set(h.draftName(h.parent), raw);
-    await h.start(); t.after(() => h.stop()); await new Promise(resolve => setTimeout(resolve, 35));
+    await h.start(); t.after(() => h.stop()); await new Promise(resolve => setTimeout(resolve, 35)); assert.equal(h.errors.length, 0); assert.equal(h.transportWrites.length, 0); await h.Zotero.ReadingFlow.syncNow();
     assert.equal(h.files.get(h.draftName(h.parent)), raw); assert.equal(h.notes.length, 0); assert.equal(h.writes.length, 0);
-    if (kind === 'corrupt') { assert.equal(h.errors.length, 1); assert.match(h.errors[0].message, /旧草稿.*保留.*迁移未完成/); }
+    if (kind === 'corrupt') { assert.ok(h.errors.some(error => /旧草稿.*保留.*迁移未完成|JSON/.test(error.message))); }
   });
 });
 
 test('a fresh device waits for a referenced synced prose note instead of creating a competing empty note', async t => {
   const a = harness(); await a.start(); t.after(() => a.stop()); const original = await a.clickRail(); original.note.html = '<p>Synced prose arrives later</p>'; original.getState().pyramid.text = 'Reasoning arrives first'; await original.config.bridge.flushState(original.getState());
-  const b = harness(); transferNotes(a, b, note => !!a.sync.decodeNote(note.html)); await b.start(); t.after(() => b.stop()); const shown = await b.clickRail();
+  const b = harness(); await publishAndTransferNotes(a, b, note => !!a.sync.decodeNote(note.html)); await b.start(); t.after(() => b.stop()); const shown = await b.clickRail();
   assert.equal(shown.getState().pyramid.text, 'Reasoning arrives first'); assert.equal(shown.getState().noteKey, original.note.key); assert.equal(b.proseNotes().length, 0);
   assert.equal(shown.editor.hidden, true); assert.equal(shown.config.syncPending, true); assert.equal(shown.config.bridge.canEdit, false);
   const pendingPreview = JSON.parse(JSON.stringify(shown.getState())); pendingPreview.pyramid.text = 'An out-of-order pending preview must not become a draft';
   assert.equal((await shown.config.bridge.flushState(pendingPreview)).ignored, true); assert.equal(b.files.has(b.draftName(b.parent)), false);
-  const before = shown.config, ids = transferNotes(a, b, note => note.key === original.note.key); await b.emitItemChange(ids, 'add');
+  const before = shown.config, ids = await publishAndTransferNotes(a, b, note => note.key === original.note.key); await b.emitItemChange(ids, 'add'); assert.equal(shown.config, before); await b.Zotero.ReadingFlow.syncNow();
   await waitUntil(() => shown.config !== before && shown.note?.key === original.note.key, 'arriving native prose should unblock the existing pyramid even when sync head is unchanged');
   assert.equal(shown.config.syncPending, false); assert.equal(shown.config.bridge.canEdit, true); assert.equal(b.proseNotes().length, 1); assert.equal(shown.note.html, '<p>Synced prose arrives later</p>');
   assert.equal(shown.getState().pyramid.text, 'Reasoning arrives first'); assert.equal(b.noteWrites.length, 0, 'waiting and arrival must not republish a replacement binding');
@@ -1010,7 +1027,7 @@ test('a fresh device waits for a referenced synced prose note instead of creatin
 
 test('preview flushes cannot overwrite a legacy conflict and choosing a remote version retains the unpublished local tree', async t => {
   const remote = harness(); await remote.start(); t.after(() => remote.stop()); const original = await remote.clickRail(); original.getState().pyramid.text = 'Remote B reasoning'; await original.config.bridge.flushState(original.getState());
-  const local = harness(); transferNotes(remote, local); const legacy = local.core.createSession(local.identity(local.parent)); legacy.pyramid.text = 'Unpublished legacy A'; legacy.noteKey = original.note.key;
+  const local = harness(); await publishAndTransferNotes(remote, local); const legacy = local.core.createSession(local.identity(local.parent)); legacy.pyramid.text = 'Unpublished legacy A'; legacy.noteKey = original.note.key;
   const raw = JSON.stringify(legacy); local.files.set(local.draftName(local.parent), raw); await local.start(); t.after(() => local.stop()); const shown = await local.clickRail();
   assert.equal(shown.config.syncConflict, true); assert.equal(shown.config.bridge.canEdit, false);
   const candidate = shown.config.syncVersions.find(version => version.state.pyramid.text === 'Remote B reasoning'); assert.ok(candidate);
@@ -1026,27 +1043,24 @@ test('preview flushes cannot overwrite a legacy conflict and choosing a remote v
   assert.ok(retained.includes('Remote B reasoning')); assert.equal(local.proseNotes().length, 1);
 });
 
-test('a background migration overtaken by an interactive open cannot replay an older snapshot', async t => {
+test('opening and editing an old local draft before its first explicit check cannot replay the older migration snapshot', async t => {
   const h = harness({ scanDrafts: true }), legacy = h.core.createSession(h.identity(h.parent)); legacy.pyramid.text = 'Old unopened draft'; h.files.set(h.draftName(h.parent), JSON.stringify(legacy));
-  let resumeMigration, signalDiscovery; const blocked = new Promise(resolve => { resumeMigration = resolve; }), discovered = new Promise(resolve => { signalDiscovery = resolve; });
-  const search = h.Zotero.Search.prototype.search; let first = true;
-  h.Zotero.Search.prototype.search = async function () { if (first) { first = false; signalDiscovery(); await blocked; } return search.call(this); };
-  await h.start(); t.after(() => h.stop()); await discovered; const shown = await h.clickRail(); shown.getState().pyramid.text = 'New interactive typing'; await shown.config.bridge.flushState(shown.getState());
-  resumeMigration(); await new Promise(resolve => setTimeout(resolve, 40));
+  await h.start(); t.after(() => h.stop()); const shown = await h.clickRail(); shown.getState().pyramid.text = 'New interactive typing'; await shown.config.bridge.flushState(shown.getState());
+  assert.equal(h.transportWrites.length, 0); await h.Zotero.ReadingFlow.syncNow();
   assert.equal(h.durable().pyramid.text, 'New interactive typing'); const loaded = await h.sync.create({ Zotero: h.Zotero, core: h.core, fileStore: h.fileStore }).load(h.identity(h.parent));
   assert.equal(loaded.state.pyramid.text, 'New interactive typing'); assert.equal(loaded.conflict, false); assert.equal(h.errors.length, 0); assert.equal(h.proseNotes().length, 1);
 });
 
-test('a sync notification during sidebar loading is retried after opening instead of being lost', async t => {
+test('an explicit sync check during sidebar loading is retried after opening instead of being lost', async t => {
   const a = harness(); await a.start(); t.after(() => a.stop()); const library = await a.clickRail(); library.getState().pyramid.text = 'Before reader opens'; await library.config.bridge.flushState(library.getState());
-  const b = harness(); transferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'Remote arrives while opening'; await other.config.bridge.flushState(other.getState());
+  const b = harness(); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop()); const other = await b.clickRail(); other.getState().pyramid.text = 'Remote arrives while opening'; await other.config.bridge.flushState(other.getState());
   a.activateReader(); const reader = a.Zotero.ReadingFlow.inspect(a.host).find(handle => handle.kind === 'reader'), app = reader.frame.contentWindow.ReadingFlowApp;
   let resumeOpening, signalLoad; const blocked = new Promise(resolve => { resumeOpening = resolve; }), loading = new Promise(resolve => { signalLoad = resolve; }), loadConfig = app.loadConfig.bind(app);
   app.loadConfig = async config => { signalLoad(); await blocked; return loadConfig(config); };
   const opening = a.Zotero.ReadingFlow.openItem(a.parent.id); await loading;
-  const ids = transferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF)); await a.emitItemChange(ids);
+  const ids = await publishAndTransferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF)); await a.emitItemChange(ids); const checking = a.Zotero.ReadingFlow.syncNow();
   await waitUntil(() => reader.syncRefreshAfterOpen, 'an in-progress sidebar opening must retain the pending notification');
-  resumeOpening(); await opening; await waitUntil(() => reader.getState()?.pyramid.text === 'Remote arrives while opening', 'pending notification must be replayed after sidebar initialization');
+  resumeOpening(); await opening; await checking; await waitUntil(() => reader.getState()?.pyramid.text === 'Remote arrives while opening', 'pending notification must be replayed after sidebar initialization');
   assert.equal(reader.config.syncConflict, false); assert.equal(a.errors.length, 0);
 });
 
@@ -1067,11 +1081,11 @@ test('concurrent first opens of one independent note publish only the latest lib
   const [obsolete, focused] = await Promise.all([libraryOpen, readerOpen]);
   assert.equal(obsolete, null); assert.equal(focused.kind, 'reader'); assert.equal(focused.note, note); assert.equal(focused.getState().pyramid.text, 'Previously saved local tree');
   assert.equal(h.Zotero.ReadingFlow.inspect(h.host).find(handle => handle.kind === 'library').config, null);
-  assert.equal(h.notes.filter(value => h.sync.decodeNote(value.html)?.kind === 'head').length, 0); assert.equal(h.transportWrites.length, 1); assert.equal(h.errors.length, 0); assert.equal(h.proseNotes().length, 1);
+  assert.equal(h.notes.filter(value => h.sync.decodeNote(value.html)?.kind === 'head').length, 0); assert.equal(h.transportWrites.length, 0); assert.equal(h.errors.length, 0); assert.equal(h.proseNotes().length, 1);
   focused.getState().pyramid.text = 'Newest focused edit'; await focused.config.bridge.flushState(focused.getState());
   h.host.Zotero_Tabs.select('zotero-pane'); const returned = await h.Zotero.ReadingFlow.openItem(note.id);
   assert.equal(returned.kind, 'library'); assert.equal(returned.getState().pyramid.text, 'Newest focused edit'); assert.equal(h.durable(note).pyramid.text, 'Newest focused edit');
-  assert.equal(h.notes.filter(value => h.sync.decodeNote(value.html)?.kind === 'head').length, 0); assert.equal(h.transportWrites.length, 2); assert.equal(h.errors.length, 0); assert.equal(note.html, '<p>Shared independent prose</p>');
+  assert.equal(h.notes.filter(value => h.sync.decodeNote(value.html)?.kind === 'head').length, 0); assert.equal(h.transportWrites.length, 0); await h.Zotero.ReadingFlow.syncNow(); assert.equal(h.transportWrites.length, 1); assert.equal([...h.transportRecords.values()].at(-1).record.state.pyramid.text, 'Newest focused edit'); assert.equal(h.errors.length, 0); assert.equal(note.html, '<p>Shared independent prose</p>');
 });
 
 test('managed data containers and their attachments cannot become reading owners', async t => {
@@ -1082,53 +1096,117 @@ test('managed data containers and their attachments cannot become reading owners
   assert.equal(h.notes.length, 0); assert.equal(h.transportWrites.length, 0);
 });
 
-test('a missing data file requests a targeted download and refreshes the preserved sidebar when it arrives', async t => {
+test('fast typing saves durable local drafts without publishing attachments or following automatic sync notifications', async t => {
   const h = harness(); await h.start(); t.after(() => h.stop()); const shown = await h.clickRail();
+  assert.equal(h.Zotero.ReadingFlow.getSyncMode(), 'manual'); assert.equal(shown.config.syncMode, 'manual');
+  const pending = [];
+  for (let i = 0; i < 30; i++) { shown.getState().pyramid.text = 'Fast typing ' + i; pending.push(shown.config.bridge.saveState(shown.getState())); }
+  await Promise.all(pending); await h.emitItemChange([h.parent.id]);
+  await h.Zotero.Sync.Runner.sync({ background: true }); await new Promise(resolve => setTimeout(resolve, 550));
+  assert.equal(h.durable().pyramid.text, 'Fast typing 29'); assert.equal(h.durable().readingFlowSync.pending, true);
+  assert.equal(h.transportWrites.length, 0); assert.equal(h.notes.length, 1); assert.equal(h.errors.length, 0); assert.equal(h.intervalTimers.size, 0);
+  assert.equal(h.maximumInFlight.get(h.draftName(h.parent)), 1);
+});
+
+test('manual synchronization publishes all durable owners once and preserves typing while the native network request runs', async t => {
+  const h = harness(); await h.start(); t.after(() => h.stop()); const first = await h.clickRail(); first.getState().pyramid.text = 'First owner'; await first.config.bridge.flushState(first.getState());
+  const shown = await h.Zotero.ReadingFlow.openItem(h.other.id); shown.getState().pyramid.text = 'Second owner'; await shown.config.bridge.flushState(shown.getState());
+  let completeNetwork; const network = new Promise(resolve => { completeNetwork = resolve; }); h.Zotero.Sync.Runner.syncImplementation = () => network;
+  shown.getState().pyramid.text = 'Latest button snapshot'; const checking = shown.config.bridge.syncNow(shown.getState());
+  await waitUntil(() => h.nativeSyncCalls.length === 1); assert.equal(h.nativeSyncCalls[0].background, false);
+  const submitted = [...h.transportRecords.values()].map(value => value.record.state.pyramid.text); assert.deepEqual(new Set(submitted), new Set(['First owner', 'Latest button snapshot']));
+  shown.getState().pyramid.text = 'New typing during network'; await shown.config.bridge.flushState(shown.getState());
+  assert.equal(h.durable(h.other).pyramid.text, 'New typing during network'); assert.equal(h.durable(h.other).readingFlowSync.pending, true); assert.equal(h.transportWrites.length, 2);
+  completeNetwork(true); await checking;
+  assert.equal(shown.getState().pyramid.text, 'New typing during network'); assert.equal(h.durable(h.other).pyramid.text, 'New typing during network'); assert.equal(shown.config.syncConflict, false);
+  assert.equal(h.transportWrites.length, 2, 'network completion must not republish edits typed after the request began');
+  h.Zotero.Sync.Runner.syncImplementation = null; await h.Zotero.ReadingFlow.syncNow(); assert.equal(h.transportWrites.length, 3);
+  assert.equal([...h.transportRecords.values()].at(-1).record.state.pyramid.text, 'New typing during network'); assert.equal(h.errors.length, 0);
+});
+
+test('typing autosaved during the final asynchronous refresh keeps its visible frame and remains a recoverable local version', async t => {
+  const a = harness(); await a.start(); t.after(() => a.stop()); const shown = await a.clickRail();
+  shown.getState().pyramid.text = 'Shared baseline'; await shown.config.bridge.flushState(shown.getState());
+  const b = harness(); await publishAndTransferNotes(a, b); await b.start(); t.after(() => b.stop()); const remote = await b.clickRail();
+  remote.getState().pyramid.text = 'Remote descendant'; await remote.config.bridge.flushState(remote.getState()); await publishAndTransferNotes(b, a);
+  const app = shown.toolsWindow.ReadingFlowApp, before = shown.config, bridge = before.bridge;
+  let releaseRead, signalRefresh, flushes = 0; const refreshing = new Promise(resolve => { signalRefresh = resolve; });
+  app.flushPendingSave = async () => { if (++flushes === 2) { releaseRead = a.blockRead(a.parent); signalRefresh(releaseRead.started); } };
+  const checking = a.Zotero.ReadingFlow.syncNow(); await refreshing;
+  app.state.pyramid.text = 'Typing after refresh began'; app.dirty = true; await bridge.flushState(app.state); app.dirty = false;
+  assert.equal(a.durable().pyramid.text, 'Typing after refresh began'); releaseRead(); await checking;
+  assert.equal(shown.config, before, 'finishing a check must not repaint an older remote snapshot over newly autosaved typing');
+  assert.equal(shown.getState().pyramid.text, 'Typing after refresh began'); assert.equal(a.durable().pyramid.text, 'Typing after refresh began'); assert.equal(a.durable().readingFlowSync.pending, true);
+  app.flushPendingSave = async () => {}; await a.Zotero.ReadingFlow.syncNow();
+  assert.equal(shown.config.syncConflict, true); assert.deepEqual(new Set(shown.config.syncVersions.map(value => value.state.pyramid.text)), new Set(['Remote descendant', 'Typing after refresh began'])); assert.equal(a.errors.length, 0);
+});
+
+test('a failed native synchronization leaves the latest local draft available for the next explicit check', async t => {
+  const h = harness(); await h.start(); t.after(() => h.stop()); const shown = await h.clickRail();
+  shown.getState().pyramid.text = 'Do not lose this draft'; await shown.config.bridge.flushState(shown.getState());
+  h.Zotero.Sync.Runner.syncImplementation = async options => { options.onError(new Error('Offline')); return false; };
+  await assert.rejects(() => h.Zotero.ReadingFlow.syncNow(), /同步未完成.*草稿.*保留/);
+  assert.equal(h.durable().pyramid.text, 'Do not lose this draft'); assert.equal(shown.getState().pyramid.text, 'Do not lose this draft');
+  shown.getState().pyramid.text = 'More offline edits'; await shown.config.bridge.flushState(shown.getState()); assert.equal(h.durable().readingFlowSync.pending, true);
+  h.Zotero.Sync.Runner.syncImplementation = null; await h.Zotero.ReadingFlow.syncNow();
+  assert.equal(h.durable().pyramid.text, 'More offline edits'); assert.equal([...h.transportRecords.values()].at(-1).record.state.pyramid.text, 'More offline edits'); assert.equal(shown.config.syncConflict, false);
+});
+
+test('the 30-minute mode persists across reopening and editing does not restart its cadence', async t => {
+  const h = harness(); await h.start(); const shown = await h.clickRail();
+  await shown.config.bridge.setSyncMode('interval'); assert.equal(h.intervalTimers.size, 1); const firstTimer = [...h.intervalTimers.keys()][0];
+  shown.getState().pyramid.text = 'Waiting for the scheduled check'; await shown.config.bridge.flushState(shown.getState());
+  await h.emitItemChange([h.parent.id]); await h.Zotero.Sync.Runner.sync({ background: true });
+  assert.equal([...h.intervalTimers.keys()][0], firstTimer); assert.equal(h.transportWrites.length, 0);
+  h.firePeriodicSync(); await waitUntil(() => h.nativeSyncCalls.length === 2 && h.intervalTimers.size === 1);
+  assert.equal(h.nativeSyncCalls[1].background, true); assert.equal(h.transportWrites.length, 1); assert.equal(h.durable().readingFlowSync.pending, false);
+  await h.stop(); assert.equal(h.intervalTimers.size, 0); const cold = coldHarness(h); await cold.start(); t.after(() => cold.stop());
+  assert.equal(cold.Zotero.ReadingFlow.getSyncMode(), 'interval'); assert.equal(cold.intervalTimers.size, 1);
+  const reopened = await cold.clickRail(); assert.equal(reopened.config.syncMode, 'interval');
+  await reopened.config.bridge.setSyncMode('manual'); assert.equal(cold.intervalTimers.size, 0); assert.equal(cold.Zotero.ReadingFlow.getSyncMode(), 'manual');
+  assert.throws(() => cold.Zotero.ReadingFlow.setSyncMode('often'), /无效/); assert.equal(cold.transportWrites.length, 0);
+});
+
+test('the saved 30-minute mode starts its timer when a main window becomes available after startup', async () => {
+  const h = harness(); h.prefs.set('readingFlow.syncMode', 'interval'); h.Zotero.getMainWindow = () => null;
+  await h.start(); assert.equal(h.intervalTimers.size, 0); assert.equal(h.Zotero.ReadingFlow.getSyncMode(), 'interval');
+  h.Zotero.getMainWindow = () => h.host; const shown = await h.Zotero.ReadingFlow.openItem(h.parent.id);
+  assert.equal(h.intervalTimers.size, 1); const timer = [...h.intervalTimers.keys()][0]; assert.equal(shown.config.syncMode, 'interval');
+  shown.getState().pyramid.text = 'Keep the original check time'; await shown.config.bridge.flushState(shown.getState());
+  assert.equal([...h.intervalTimers.keys()][0], timer); assert.equal(h.transportWrites.length, 0);
+  await h.stop(); assert.equal(h.intervalTimers.size, 0);
+});
+
+test('Zotero manual sync stages a local snapshot before native upload while automatic sync does not', async t => {
+  const h = harness(); await h.start(); t.after(() => h.stop()); const shown = await h.clickRail();
+  shown.getState().pyramid.text = 'Native-button snapshot'; await shown.config.bridge.flushState(shown.getState());
+  await h.Zotero.Sync.Runner.sync({ background: true }); assert.equal(h.transportWrites.length, 0);
+  h.Zotero.Sync.Runner.syncImplementation = async () => { assert.equal(h.transportWrites.length, 1); assert.equal([...h.transportRecords.values()].at(-1).record.state.pyramid.text, 'Native-button snapshot'); return true; };
+  await h.Zotero.Sync.Runner.sync({ background: false }); assert.equal(h.transportWrites.length, 1); assert.equal(h.errors.length, 0);
+});
+
+test('missing remote files preserve an editable local draft until an explicit download check completes', async t => {
+  const h = harness(); await h.start(); t.after(() => h.stop()); let shown = await h.clickRail();
   shown.getState().pyramid.text = 'Original local reasoning'; await shown.config.bridge.flushState(shown.getState());
   const read = h.fileStore.read.bind(h.fileStore); let missing = true, requests = 0, completeDownload;
   const downloading = new Promise(resolve => { completeDownload = resolve; });
-  h.fileStore.read = async id => { const result = await read(id); return { ...result, pending: missing ? [{ key: 'REMOTE01', reason: 'missing' }] : [] }; };
+  h.fileStore.read = async id => ({ ...await read(id), pending: missing ? [{ key: 'REMOTE01', reason: 'missing' }] : [] });
   h.fileStore.requestDownloads = async id => { assert.equal(id, 1); requests++; await downloading; missing = false; return [{ key: 'REMOTE01', downloaded: true }]; };
-  await h.emitItemChange([h.parent.id]);
-  await waitUntil(() => shown.config.syncPending, 'missing bytes must preserve the existing tree as read-only');
-  assert.equal(shown.getState().pyramid.text, 'Original local reasoning'); assert.equal(requests, 1);
-  completeDownload(); await waitUntil(() => !shown.config.syncPending, 'download completion must refresh the native sidebar');
-  assert.equal(shown.getState().pyramid.text, 'Original local reasoning'); assert.equal(h.errors.length, 0);
+  await h.emitItemChange([h.parent.id]); await new Promise(resolve => setTimeout(resolve, 280)); assert.equal(requests, 0);
+  h.activateReader(); shown = await h.clickRail('reader');
+  assert.equal(shown.config.syncPending, true); assert.equal(shown.config.syncCanEditLocal, true); assert.equal(shown.config.bridge.canEdit, true);
+  shown.getState().pyramid.text = 'Continue working while a file is missing'; await shown.config.bridge.flushState(shown.getState());
+  assert.equal(h.durable().pyramid.text, 'Continue working while a file is missing'); assert.equal(h.transportWrites.length, 0);
+  const checking = h.Zotero.ReadingFlow.syncNow(); await waitUntil(() => requests === 1); completeDownload(); await checking;
+  assert.equal(shown.config.syncPending, false); assert.equal(shown.getState().pyramid.text, 'Continue working while a file is missing'); assert.equal(h.errors.length, 0);
 });
 
-test('shutdown does not wait for a native network download and its later completion cannot restart plugin work', async () => {
-  const h = harness(); await h.start(); const shown = await h.clickRail();
-  const read = h.fileStore.read.bind(h.fileStore); let completeDownload, requested = false;
-  const downloading = new Promise(resolve => { completeDownload = resolve; });
-  h.fileStore.read = async id => ({ ...await read(id), pending: [{ key: 'REMOTE01', reason: 'missing' }] });
-  h.fileStore.requestDownloads = async () => { requested = true; await downloading; return [{ key: 'REMOTE01', downloaded: true }]; };
-  await h.emitItemChange([h.parent.id]); await waitUntil(() => requested && shown.config.syncPending);
-  let stopped = false; const stopping = h.stop().then(() => { stopped = true; });
-  await waitUntil(() => stopped, 'native network requests must not block shutdown'); await stopping;
-  const writes = h.writes.length, transportWrites = h.transportWrites.length, dbCalls = h.dbCalls.length;
-  completeDownload(); await new Promise(resolve => setTimeout(resolve, 600));
-  assert.equal(h.writes.length, writes); assert.equal(h.transportWrites.length, transportWrites); assert.equal(h.dbCalls.length, dbCalls); assert.equal(h.observers.size, 0); assert.equal(h.errors.length, 0);
-});
-
-test('a Zotero sync finish retries data-file maintenance without creating new data notes', async t => {
-  const h = harness(); await h.start(); t.after(() => h.stop()); await h.Zotero.ReadingFlow.maintenance();
-  const search = h.Zotero.Search.prototype.search; let maintenanceRuns = 0;
-  h.Zotero.Search.prototype.search = async function () { if (this.conditions.some(value => value.condition === 'note' && value.value === 'KIND:head')) maintenanceRuns++; return search.call(this); };
-  await h.Zotero.Notifier.trigger('finish', 'sync', [1]);
-  await waitUntil(() => maintenanceRuns === 1, 'the SDK sync completion event must retry archival after upload');
-  assert.equal(h.notes.length, 0); assert.equal(h.errors.length, 0);
-});
-
-test('an upload finishing during data-file maintenance is retried after that pass completes', async t => {
-  const h = harness(); await h.start(); t.after(() => h.stop()); await h.Zotero.ReadingFlow.maintenance();
-  const search = h.Zotero.Search.prototype.search; let runs = 0, release;
-  const blocked = new Promise(resolve => { release = resolve; });
-  h.Zotero.Search.prototype.search = async function () {
-    if (this.conditions.some(value => value.condition === 'note' && value.value === 'KIND:head')) { runs++; if (runs === 1) await blocked; }
-    return search.call(this);
-  };
-  const pass = h.Zotero.ReadingFlow.maintenance(); await waitUntil(() => runs === 1);
-  await h.Zotero.Notifier.trigger('finish', 'sync', [1]); release(); await pass;
-  await waitUntil(() => runs === 2, 'an upload completion cannot be swallowed by the preceding migration pass');
-  assert.equal(h.errors.length, 0);
+test('shutdown does not wait for a native network check and its later completion cannot perform database work', async () => {
+  const h = harness(); await h.start(); const shown = await h.clickRail(); shown.getState().pyramid.text = 'Retain through shutdown'; await shown.config.bridge.flushState(shown.getState());
+  let completeNetwork; const network = new Promise(resolve => { completeNetwork = resolve; }); h.Zotero.Sync.Runner.syncImplementation = () => network;
+  const checking = h.Zotero.ReadingFlow.syncNow(); await waitUntil(() => h.nativeSyncCalls.length === 1);
+  let stopped = false; const stopping = h.stop().then(() => { stopped = true; }); await waitUntil(() => stopped, 'the native network request must not block shutdown'); await stopping;
+  const writes = h.writes.length, publications = h.transportWrites.length, dbCalls = h.dbCalls.length;
+  completeNetwork(true); assert.equal((await checking).ignored, true); await new Promise(resolve => setTimeout(resolve, 550));
+  assert.equal(h.writes.length, writes); assert.equal(h.transportWrites.length, publications); assert.equal(h.dbCalls.length, dbCalls); assert.equal(h.observers.size, 0); assert.equal(h.errors.length, 0);
 });

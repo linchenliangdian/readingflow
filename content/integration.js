@@ -6,11 +6,13 @@ var ReadingFlowIntegration = (function () {
   const MAX_BACKUP_BYTES = 16 * 1024 * 1024;
   const SIDEBAR_NOTE_TAG = "Reading Flow · sidebar";
   const ICON = "chrome://reading-flow/content/icons/pyramid.svg";
+  const SYNC_MODE_PREF = "readingFlow.syncMode", SYNC_INTERVAL_MS = 30 * 60 * 1000;
   const hosts = new Map(), saveQueues = new Map(), pendingOpens = new Set(), pendingDetaches = new Set(), detachOperations = new Map(), noteQueues = new Map(), activeHandles = new Map(), focusVersions = new Map(), menuIDs = [];
   const unsavedNotes = new WeakMap();
-  const localRecords = new Map(), dataDownloads = new Map();
+  const localRecords = new Map();
   let syncStore = null, fileStore = null, migrationPromise = null, syncRefreshTimer = null;
   let dataMaintenancePromise = null, dataMaintenanceTimer = null, dataMaintenanceAgain = false;
+  let periodicSyncTimer = null, periodicSyncWindow = null, syncRunPromise = null, stagingPromise = null, nativeManualSync = false;
   let resourceVersion = "";
   let active = false, dataDirectory = null, FilePicker = null, publicAPI = null, registeredPaneID = null, readerHandler = null, notifierID = null, stopPromise = null;
   function sessionKey(item) { return item.libraryID + "-" + item.key; }
@@ -90,24 +92,131 @@ var ReadingFlowIntegration = (function () {
   function saveState(item, state) {
     return queueSave(item, () => writeDraft(item, state, localRecords.get(sessionKey(item))?.readingFlowSync));
   }
-  function requestDataDownloads(libraryID) {
-    const store = fileStore;
-    if (!active || !store?.requestDownloads || dataDownloads.has(libraryID)) return;
-    const request = Promise.resolve().then(() => store.requestDownloads(libraryID));
-    dataDownloads.set(libraryID, request);
-    request.then(results => {
-      if (active && fileStore === store && results?.some(result => result.downloaded)) {
-        scheduleDataMaintenance(); scheduleSyncRefresh();
+  function syncMode() { return Zotero.Prefs.get(SYNC_MODE_PREF) === "interval" ? "interval" : "manual"; }
+  function schedulePeriodicSync() {
+    if (periodicSyncTimer !== null) { periodicSyncWindow?.clearTimeout(periodicSyncTimer); periodicSyncTimer = null; }
+    periodicSyncWindow = null;
+    if (!active || syncMode() !== "interval") return;
+    const window = Zotero.getMainWindow(); if (!window) return;
+    periodicSyncWindow = window;
+    periodicSyncTimer = window.setTimeout(() => {
+      periodicSyncTimer = null; periodicSyncWindow = null;
+      runSync({ background: true }).catch(error => Zotero.logError(error)).finally(() => {
+        if (active && syncMode() === "interval") schedulePeriodicSync();
+      });
+    }, SYNC_INTERVAL_MS);
+  }
+  function setSyncMode(mode) {
+    if (!["manual", "interval"].includes(mode)) throw new Error("同步方式无效。");
+    Zotero.Prefs.set(SYNC_MODE_PREF, mode); schedulePeriodicSync();
+    for (const handle of activeHandles.values()) {
+      if (handle.config) handle.config.syncMode = mode;
+      toolsWindow(handle)?.ReadingFlowApp?.setSyncMode?.(mode);
+    }
+    return { mode, message: mode === "manual" ? "已改为手动同步；输入仍自动保存到本机" : "每 30 分钟同步；输入仍自动保存到本机" };
+  }
+  async function saveLocalDraft(item, state) {
+    return queueSave(item, async () => {
+      const meta = localRecords.get(sessionKey(item))?.readingFlowSync;
+      await writeDraft(item, state, { ...meta, format: ReadingFlowSync.FORMAT, ownerKey: item.key,
+        clock: meta?.clock || {}, pending: true });
+      return { message: "已保存到本机 · 待同步" };
+    });
+  }
+  async function stageLocalDrafts({ retry = null } = {}) {
+    if (stagingPromise) return stagingPromise;
+    const store = syncStore;
+    const operation = (async () => {
+      const result = { published: 0, blocked: 0, retry: new Map() };
+      for (const handle of Array.from(activeHandles.values())) {
+        if (!active || syncStore !== store) return result;
+        if (handle.config && !handle.disposed) await flushHandle(handle);
       }
-    }).catch(error => { if (active && fileStore === store) Zotero.logError(error); })
-      .finally(() => { if (dataDownloads.get(libraryID) === request) dataDownloads.delete(libraryID); });
+      const candidates = new Map();
+      for (const raw of localRecords.values()) if (raw.item) candidates.set(sessionKey(raw.item), raw.item);
+      if (typeof IOUtils.getChildren === "function" && await IOUtils.exists(dataDirectory)) {
+        for (const path of await IOUtils.getChildren(dataDirectory)) {
+          const match = /(?:^|[\\/])(\d+)-([A-Z0-9]{8})\.json$/.exec(path);
+          if (match) candidates.set(match[1] + "-" + match[2], { libraryID: Number(match[1]), key: match[2] });
+        }
+      }
+      for (const candidate of candidates.values()) {
+        if (!active || syncStore !== store) break;
+        try {
+          const parent = await Zotero.Items.getByLibraryAndKeyAsync(candidate.libraryID, candidate.key);
+          if (!parentOf(parent)) continue;
+          const item = identity(parent), library = Zotero.Libraries.get(item.libraryID), key = sessionKey(item);
+          if (retry && !retry.has(key)) continue;
+          if (!library?.editable || library.filesEditable === false) continue;
+          await queueSave(item, async () => {
+            if (!active || syncStore !== store || !(await IOUtils.exists(draftPath(item)))) return;
+            const raw = await readJSON(draftPath(item)); localRecords.set(key, raw);
+            const rawHash = ReadingFlowSync.stateHash(raw);
+            if (retry && retry.get(key) !== rawHash) { result.blocked++; return; }
+            const loaded = await store.load(item, raw);
+            if (loaded.pending || loaded.conflict) { result.blocked++; result.retry.set(key, rawHash); return; }
+            if (!loaded.needsPublish && loaded.hasRemote) return;
+            const note = loaded.state.noteKey && await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, loaded.state.noteKey);
+            if (!validNativeNote(note, item, parent.isNote() ? null : parent.id)) { result.blocked++; return; }
+            if (!active || syncStore !== store) return;
+            const saved = await store.save(item, loaded.state, loaded.token);
+            await writeDraft(item, loaded.state, saved.cacheMeta, { published: true });
+            if (active && syncStore === store) await cleanLegacyNoteTags(note, item, parent.isNote() ? null : parent.id);
+            const handle = activeHandles.get(key);
+            if (handle) { handle.syncToken = saved.token; handle.syncSignature = saved.token.signature; }
+            result.published++;
+          });
+        } catch (error) { result.blocked++; Zotero.logError(error); }
+      }
+      return result;
+    })();
+    stagingPromise = operation;
+    operation.finally(() => { if (stagingPromise === operation) stagingPromise = null; }).catch(() => {});
+    return operation;
+  }
+  function runSync({ background = false } = {}) {
+    if (!active) return Promise.reject(new Error("阅读台正在关闭，本机草稿已保留。"));
+    if (syncRunPromise) return syncRunPromise;
+    const store = syncStore, files = fileStore;
+    const operation = Promise.resolve().then(async () => {
+      const visibleAtStart = new Map();
+      for (const handle of activeHandles.values()) {
+        const state = toolsWindow(handle)?.ReadingFlowApp?.getState?.();
+        if (state) visibleAtStart.set(handle, ReadingFlowSync.stateHash(state));
+      }
+      const staged = await stageLocalDrafts();
+      if (!active || syncStore !== store) return { ignored: true };
+      await maintainDataFiles();
+      if (!active || syncStore !== store) return { ignored: true };
+      const runner = Zotero.Sync?.Runner;
+      if (typeof runner?.sync !== "function") throw new Error("已保存到本机；请使用 Zotero 的同步按钮完成文件同步。");
+      const errors = [];
+      const nativeSync = () => runner.sync({ background, onError(error) { errors.push(error); runner.addError?.(error); } });
+      const completed = await nativeSync();
+      if (!active || syncStore !== store) return { ignored: true };
+      if (completed === false || errors.length) throw new Error("Zotero 同步未完成，本机草稿和已提交的数据均已保留；请查看 Zotero 同步提示。");
+      for (const library of Zotero.Libraries.getAll()) {
+        if (!active || syncStore !== store) return { ignored: true };
+        await files.requestDownloads?.(library.libraryID);
+      }
+      if (!active || syncStore !== store) return { ignored: true };
+      const maintenance = await maintainDataFiles();
+      const retried = staged.retry.size ? await stageLocalDrafts({ retry: staged.retry }) : { published: 0, blocked: staged.blocked };
+      if (!active || syncStore !== store) return { ignored: true };
+      if (retried.published || maintenance?.migrated) {
+        const second = await nativeSync();
+        if (!active || syncStore !== store) return { ignored: true };
+        if (second === false || errors.length) throw new Error("Zotero 同步未完成，本机草稿和已提交的数据均已保留；请查看 Zotero 同步提示。");
+      }
+      await refreshSyncedHandles({ preserveEditsSince: visibleAtStart });
+      return { message: retried.blocked ? "已执行同步；部分版本需确认或等待文件下载，本机草稿已保留" : "已提交 Zotero 同步；新输入继续保存在本机" };
+    });
+    syncRunPromise = operation;
+    operation.finally(() => { if (syncRunPromise === operation) syncRunPromise = null; }).catch(() => {});
+    return operation;
   }
   async function loadSyncedState(item, localRaw) {
-    try {
-      const loaded = await syncStore.load(item, localRaw);
-      if (loaded.pending) requestDataDownloads(item.libraryID);
-      return loaded;
-    } catch (error) { requestDataDownloads(item.libraryID); throw error; }
+    return syncStore.load(item, localRaw);
   }
   function saveSyncedState(item, state, token, options) {
     return queueSave(item, async () => {
@@ -553,6 +662,7 @@ var ReadingFlowIntegration = (function () {
   }
   function attachWindow(window) {
     if (!active || !window || window.closed) return null;
+    if (syncMode() === "interval" && !syncRunPromise && (periodicSyncTimer === null || periodicSyncWindow?.closed)) schedulePeriodicSync();
     if (hosts.has(window)) { const host = hosts.get(window); ensureMainPanels(host); return host; }
     const host = { window, panels: new Map(), click: null, unload: null, resize: null }; hosts.set(window, host); ensureMainPanels(host);
     host.click = event => {
@@ -659,27 +769,37 @@ var ReadingFlowIntegration = (function () {
     }
     const generation = ++handle.generation;
     const operation = (async () => {
+      let refreshApp = null, refreshStateHash = null;
+      const typedDuringRefresh = () => !!(refreshApp && (refreshApp.hasPendingChanges?.() ||
+        ReadingFlowSync.stateHash(refreshApp.getState()) !== refreshStateHash));
       const previousWriter = activeHandles.get(key);
       if (previousWriter && previousWriter !== handle) await flushHandle(previousWriter);
-      if (options.refresh) await flushNative(handle); else await flushHandle(handle);
+      await flushHandle(handle);
+      if (options.refresh) {
+        refreshApp = toolsWindow(handle)?.ReadingFlowApp;
+        if (refreshApp?.getState()) refreshStateHash = options.preserveStateHash || ReadingFlowSync.stateHash(refreshApp.getState()); else refreshApp = null;
+      }
       if (!active || generation !== handle.generation) return null;
       if (parentID === null) { await flushExternalNote(handle, parent); if (!active || generation !== handle.generation) return null; }
       const localState = await initialState(item); if (!active || generation !== handle.generation) return null;
       const localRaw = localRecords.get(key) || null;
       let synced = await loadSyncedState(item, localRaw);
+      const canEditPendingDraft = !!(synced.pending && !synced.conflict && localRaw);
       const state = synced.state || localState;
       if (!active || generation !== handle.generation || focusVersions.get(key) !== focusVersion) return null;
       const syncedNoteKey = state.noteKey;
       const { note, readOnly, notice, awaitingSyncedNote } = await managedNote(parent, item, state, { waitForSyncedNote: synced.hasRemote && !localRaw }); if (!active || generation !== handle.generation) return null;
       if (focusVersions.get(key) !== focusVersion) return null;
+      if (typedDuringRefresh()) return handle;
       if (awaitingSyncedNote) synced = { ...synced, pending: true };
       handle.syncToken = synced.token; handle.syncSignature = synced.token?.signature;
-      if (!readOnly && !synced.conflict && !synced.pending && (synced.needsPublish || !synced.hasRemote || syncedNoteKey !== state.noteKey)) {
-        const saved = await saveSyncedState(item, state, handle.syncToken, { canPublish: () => active && generation === handle.generation && focusVersions.get(key) === focusVersion });
-        if (saved.ignored) return null;
-        handle.syncToken = saved.token; handle.syncSignature = saved.token?.signature;
-        synced = { ...synced, token: saved.token, needsPublish: false };
+      if (!readOnly && !synced.conflict && !synced.pending) {
+        const pending = synced.needsPublish || !synced.hasRemote || syncedNoteKey !== state.noteKey;
+        const meta = { ...(localRaw?.readingFlowSync || {}), format: ReadingFlowSync.FORMAT, ownerKey: item.key,
+          clock: synced.token?.clock || {}, revision: synced.token?.selected, pending };
+        await queueSave(item, () => typedDuringRefresh() ? Promise.resolve() : writeDraft(item, state, meta, { published: !pending }));
       }
+      if (typedDuringRefresh()) return handle;
       if (focusVersions.get(key) !== focusVersion) return null;
       // Keep legacy recovery tags until the accepted synced state contains the
       // same note key, so another device can still recover a failed publication.
@@ -695,27 +815,31 @@ var ReadingFlowIntegration = (function () {
       const guardedSave = value => {
         const normalized = snapshot(value, item);
         if (handle.config !== config || activeHandles.get(key) !== handle) return Promise.resolve({ message: "已在当前阅读侧栏保存", ignored: true });
-        if (config.syncConflict || config.syncPending) return Promise.resolve({ message: "各版本已保留，请先完成同步或选择版本", ignored: true });
+        if (config.syncConflict || config.syncPending && !config.syncCanEditLocal) return Promise.resolve({ message: "各版本已保留，请先完成同步或选择版本", ignored: true });
         normalized.noteKey = boundNoteKey || normalized.noteKey || "";
         if (readOnly) return saveState(item, normalized);
         if (!validHandleNote(handle)) {
           stopSavingUnboundNote(handle);
           return queueSave(item, () => writeDraft(item, normalized, { ...localRecords.get(key)?.readingFlowSync, pending: true }));
         }
-        return saveSyncedState(item, normalized, () => handle.syncToken).then(result => {
-          if (handle.config === config) { handle.syncToken = result.token; handle.syncSignature = result.token?.signature; }
-          return result;
-        }).catch(error => { scheduleSyncRefresh(); throw error; });
+        return saveLocalDraft(item, normalized);
       };
-      const config = { item, initialState: state, readOnly: readOnly || synced.conflict || synced.pending, syncConflict: !!synced.conflict, syncPending: !!synced.pending, syncVersions: synced.versions || [], selectedSyncVersion: synced.token?.selected, syncCanResolve: !readOnly, pyramidHeight: pyramidHeightPreference(), bridge: {
+      const config = { item, initialState: state, readOnly: readOnly || synced.conflict || synced.pending && !canEditPendingDraft, syncConflict: !!synced.conflict, syncPending: !!synced.pending, syncCanEditLocal: !readOnly && canEditPendingDraft, syncVersions: synced.versions || [], selectedSyncVersion: synced.token?.selected, syncCanResolve: !readOnly,
+        syncMode: syncMode(), syncCanRun: !readOnly, pyramidHeight: pyramidHeightPreference(), bridge: {
         saveState: guardedSave, saveDraft: guardedSave, flushState: guardedSave,
+        setSyncMode,
+        async syncNow(value) {
+          if (handle.config !== config || activeHandles.get(key) !== handle || readOnly) throw new Error("请在当前可编辑的阅读侧栏同步。");
+          if (!config.syncConflict && (!config.syncPending || config.syncCanEditLocal) && value) await guardedSave(value);
+          return runSync();
+        },
         exportNote: async value => {
           if (handle.config !== config || activeHandles.get(key) !== handle) throw new Error("当前文献已切换，请在当前阅读侧栏保存笔记。");
           await guardedSave(value);
           if (handle.config !== config || activeHandles.get(key) !== handle) throw new Error("当前文献已切换，阅读草稿已保留。");
           return exportNote(handle);
         },
-        exportJSON: value => exportJSON(item, value, handle.hostWindow), importJSON: () => importJSON(item, handle.hostWindow), canEdit: !readOnly && !synced.conflict && !synced.pending,
+        exportJSON: value => exportJSON(item, value, handle.hostWindow), importJSON: () => importJSON(item, handle.hostWindow), canEdit: !readOnly && !synced.conflict && (!synced.pending || canEditPendingDraft),
         async resolveSyncVersion(id) {
           if (readOnly || handle.config !== config || activeHandles.get(key) !== handle) throw new Error("请在当前可编辑的阅读侧栏选择版本。");
           let fresh = await loadSyncedState(item, localRecords.get(key) || null);
@@ -746,7 +870,8 @@ var ReadingFlowIntegration = (function () {
       hideOwnNoteFooter(handle.editor);
       selectPanel(handle); await loadTools(handle, config, generation); if (!active || generation !== handle.generation) return null;
       const app = toolsWindow(handle) && toolsWindow(handle).ReadingFlowApp;
-      const message = [notice, synced.notice].filter(Boolean).join(" ");
+      const syncNotice = canEditPendingDraft ? "同步文件尚未到齐；现有草稿可在本机编辑，点击同步后再提交。" : synced.notice;
+      const message = [notice, syncNotice].filter(Boolean).join(" ");
       if (message && handle.config === config && app && typeof app.showNotice === "function") app.showNotice(message);
       return handle;
     })();
@@ -787,24 +912,29 @@ var ReadingFlowIntegration = (function () {
     }] });
     if (!registered) throw new Error("无法注册阅读台菜单，请检查 Zotero 版本是否为 9.0.x。"); menuIDs.push(registered);
   }
-  async function refreshSyncedHandles() {
+  async function refreshSyncedHandles({ preserveEditsSince = null } = {}) {
     for (const handle of Array.from(activeHandles.values())) {
       if (!active || handle.disposed || !handle.item || !handle.config) continue;
       if (handle.opening) { handle.syncRefreshAfterOpen = true; continue; }
+      if (preserveEditsSince?.has(handle)) {
+        const visible = toolsWindow(handle)?.ReadingFlowApp?.getState?.();
+        if (visible && ReadingFlowSync.stateHash(visible) !== preserveEditsSince.get(handle)) continue;
+      }
       const config = handle.config, item = handle.item, key = sessionKey(item);
       try {
         const pending = saveQueues.get(key); if (pending) await pending.catch(() => {});
         let remote = await loadSyncedState(item, localRecords.get(key) || null);
+        const sameStatus = () => !!remote.pending === !!config.syncPending && !!remote.conflict === !!config.syncConflict;
         const bindingArrived = !handle.note && remote.state?.noteKey && await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, remote.state.noteKey);
-        if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && !bindingArrived) continue;
+        if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && sameStatus() && !bindingArrived) continue;
         const app = toolsWindow(handle)?.ReadingFlowApp;
         if (app && typeof app.hasPendingChanges === "function" && app.hasPendingChanges()) {
           try { await app.flushPendingSave(); } catch (_) { /* The local draft remains available as a conflict version. */ }
           remote = await loadSyncedState(item, localRecords.get(key) || null);
         }
-        if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && !bindingArrived) continue;
+        if (!active || handle.config !== config || remote.token?.signature === handle.syncSignature && sameStatus() && !bindingArrived) continue;
         const parent = await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, item.key);
-        if (parentOf(parent)) await openInHandle(handle, parent, { refresh: true });
+        if (parentOf(parent)) await openInHandle(handle, parent, { refresh: true, preserveStateHash: preserveEditsSince?.get(handle) });
       }
       catch (error) {
         Zotero.logError(error);
@@ -843,28 +973,6 @@ var ReadingFlowIntegration = (function () {
       }).catch(error => Zotero.logError(error));
     }, 500);
   }
-  async function migrateLocalDrafts() {
-    if (typeof IOUtils.getChildren !== "function" || !(await IOUtils.exists(dataDirectory))) return;
-    for (const path of await IOUtils.getChildren(dataDirectory)) {
-      if (!active) break;
-      const match = /(?:^|[\\/])(\d+)-([A-Z0-9]{8})\.json$/.exec(path); if (!match) continue;
-      try {
-        const parent = await Zotero.Items.getByLibraryAndKeyAsync(Number(match[1]), match[2]);
-        if (!parentOf(parent) || !Zotero.Libraries.get(parent.libraryID)?.editable) continue;
-        const item = identity(parent), key = sessionKey(item);
-        if (activeHandles.has(key) || Array.from(pendingOpens).length) continue;
-        await initialState(item);
-        const loaded = await loadSyncedState(item, localRecords.get(key) || null);
-        if (!active || activeHandles.has(key) || loaded.pending || loaded.conflict || !loaded.needsPublish && loaded.hasRemote) continue;
-        if (loaded.state.noteKey) {
-          const note = await Zotero.Items.getByLibraryAndKeyAsync(item.libraryID, loaded.state.noteKey);
-          if (!validNativeNote(note, item, parent.isNote() ? null : parent.id)) continue;
-        }
-        await saveSyncedState(item, loaded.state, loaded.token, { migration: true });
-      }
-      catch (error) { Zotero.logError(new Error("Reading flow：旧草稿仍保留，迁移未完成。" + path + "\n" + (error.message || error))); }
-    }
-  }
   async function start({ id, version }) {
     resourceVersion = typeof version === "string" ? version : "";
     if (!Zotero.ItemPaneManager || !Zotero.ItemPaneManager.registerSection) throw new Error("当前 Zotero 缺少所需的侧栏接口。");
@@ -872,6 +980,7 @@ var ReadingFlowIntegration = (function () {
     if (typeof ReadingFlowFileSync === "undefined") throw new Error("Reading flow 数据文件模块未能载入，请重新启用插件。");
     fileStore = ReadingFlowFileSync.create({ Zotero, IOUtils, PathUtils });
     syncStore = ReadingFlowSync.create({ Zotero, core, fileStore });
+    syncRunPromise = null; stagingPromise = null; nativeManualSync = false;
     registeredPaneID = Zotero.ItemPaneManager.registerSection({ paneID: "reading-flow", pluginID: id, header: { l10nID: "sidenav-notes", icon: ICON }, sidenav: { l10nID: "sidenav-notes", icon: ICON, orderable: false },
       onInit({ doc, body }) { attachWindow(doc.defaultView); body.closest("item-pane-custom-section").style.display = "none"; },
       onItemChange({ doc, item, tabType, setEnabled }) {
@@ -896,8 +1005,23 @@ var ReadingFlowIntegration = (function () {
     readerHandler = ({ reader }) => { if (!active || !reader || !reader._window) return; const host = attachWindow(reader._window); if (host && reader._window.reader && !reader._window.ZoteroPane) ensureStandalone(host, reader); };
     if (Zotero.Reader) { Zotero.Reader.registerEventListener("renderToolbar", readerHandler, id); for (const reader of Zotero.Reader._readers || []) readerHandler({ reader }); }
     notifierID = Zotero.Notifier.registerObserver({ notify(action, type) {
-      if (type === "sync" && action === "finish") { scheduleDataMaintenance(); scheduleSyncRefresh(); return; }
-      if (type === "item" && ["add", "modify", "delete", "trash", "refresh"].includes(action)) { scheduleDataMaintenance(); scheduleSyncRefresh(); return; }
+      if (type === "sync" && action === "start") {
+        if (!syncRunPromise && Zotero.Sync?.Runner?.backgroundSync === false) {
+          nativeManualSync = true;
+          return stageLocalDrafts();
+        }
+        return;
+      }
+      if (type === "sync" && action === "finish") {
+        if (nativeManualSync && !syncRunPromise) {
+          nativeManualSync = false;
+          scheduleDataMaintenance(); scheduleSyncRefresh();
+        }
+        return;
+      }
+      // Ordinary item saves and background Zotero sync never republish or
+      // rebuild a pyramid while someone is typing in its local draft.
+      if (type === "item") return;
       if (type !== "tab" || !["select", "load"].includes(action)) return;
       for (const host of hosts.values()) { const handle = host.panels.get("reader"); if (!handle || handle.deck.selectedPanel !== handle.panel) continue; const parent = panelParent(handle); if (parent) openInHandle(handle, parent).catch(error => Zotero.logError(error)); }
     } }, ["tab", "item", "sync"], "reading-flow");
@@ -906,9 +1030,12 @@ var ReadingFlowIntegration = (function () {
       async openItem(itemID, window) { if (!Number.isInteger(itemID) || itemID <= 0) throw new Error("文献编号无效。"); const parent = parentOf(await Zotero.Items.getAsync(itemID)); if (!parent) throw new Error("请从文献条目、它的子附件或独立笔记打开阅读台。"); return open(parent, window); },
       inspect(window) { const host = hosts.get(window || Zotero.getMainWindow()); return host ? Array.from(host.panels.values()) : []; },
       maintenance() { return maintainDataFiles(); },
+      syncNow(options) { return runSync(options); }, getSyncMode: syncMode, setSyncMode,
       get paneID() { return registeredPaneID; }
     }; Zotero.ReadingFlow = publicAPI;
-    migrationPromise = maintainDataFiles().catch(error => Zotero.logError(error)).then(() => migrateLocalDrafts()).catch(error => Zotero.logError(error));
+    // Migration is included in an explicit/periodic sync, never in startup or
+    // the per-keystroke autosave path.
+    migrationPromise = null; schedulePeriodicSync();
     if (typeof Zotero.addShutdownListener === "function") {
       const ownedAPI = publicAPI;
       Zotero.addShutdownListener(async () => {
@@ -934,6 +1061,10 @@ var ReadingFlowIntegration = (function () {
   }
   async function stopNow() {
     dataMaintenanceAgain = false;
+    if (periodicSyncTimer !== null) { periodicSyncWindow?.clearTimeout(periodicSyncTimer); periodicSyncTimer = null; }
+    periodicSyncWindow = null;
+    nativeManualSync = false;
+    if (stagingPromise) { try { await stagingPromise; } catch (_) {} }
     if (syncRefreshTimer !== null) { Zotero.getMainWindow()?.clearTimeout(syncRefreshTimer); syncRefreshTimer = null; }
     if (dataMaintenanceTimer !== null) { Zotero.getMainWindow()?.clearTimeout(dataMaintenanceTimer); dataMaintenanceTimer = null; }
     if (migrationPromise) await migrationPromise; migrationPromise = null;
@@ -953,7 +1084,7 @@ var ReadingFlowIntegration = (function () {
     await Promise.allSettled(Array.from(saveQueues.values()));
     // Plugin API unregister refreshes start SQLite transactions but return boolean.
     if (Zotero.DB && typeof Zotero.DB.waitForTransaction === "function") await Zotero.DB.waitForTransaction();
-    pendingOpens.clear(); saveQueues.clear(); noteQueues.clear(); activeHandles.clear(); focusVersions.clear(); detachOperations.clear(); localRecords.clear(); dataDownloads.clear(); syncStore = null; fileStore = null;
+    pendingOpens.clear(); saveQueues.clear(); noteQueues.clear(); activeHandles.clear(); focusVersions.clear(); detachOperations.clear(); localRecords.clear(); syncStore = null; fileStore = null;
   }
   return { start, stop, attachWindow, detachWindow };
 })();

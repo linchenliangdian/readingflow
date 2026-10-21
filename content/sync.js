@@ -207,7 +207,11 @@
         }
         catch (_) { broken.push("file:" + sourceKey + ":" + record.revision); }
       }
-      const fingerprint = heads.map(head => head.key + ":" + head.id + ":" + head.payloadHash)
+      // An immutable snapshot can carry a previously published revision. Its
+      // physical attachment is not another edit and must not invalidate tokens.
+      const logicalHeads = heads.map(head => head.id + ":" + head.payloadHash + ":" + head.deviceID + ":" +
+        JSON.stringify(Object.entries(head.clock).sort(([a], [b]) => a.localeCompare(b))));
+      const fingerprint = Array.from(new Set(logicalHeads))
         .concat(broken.map(key => key + ":pending")).sort().join("|");
       return { heads, broken, fingerprint, legacy };
     }
