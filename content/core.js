@@ -192,9 +192,13 @@
     base.noteKey = typeof raw.noteKey === "string" && /^[A-Z0-9]{8}$/.test(raw.noteKey) ? raw.noteKey : null;
     if (raw.terms !== undefined && !Array.isArray(raw.terms)) throw new Error("术语数据必须是列表。");
     if ((raw.terms || []).length > 300) throw new Error("术语数量超过 300 条。");
-    base.terms = (raw.terms || []).map(t => ({
-      id: uid(), term: text(t && t.term), meaning: text(t && t.meaning), source: text(t && t.source), uncertain: !!(t && t.uncertain === true)
-    }));
+    const termIDs = new Set();
+    base.terms = (raw.terms || []).map(t => {
+      let id = t && t.id;
+      if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id) || termIDs.has(id)) id = uid();
+      termIDs.add(id);
+      return { id, term: text(t && t.term), meaning: text(t && t.meaning), source: text(t && t.source), uncertain: !!(t && t.uncertain === true) };
+    });
     base.pyramid = node(raw.pyramid || base.pyramid, 0);
     base.pyramid.id = "root";
     base.pyramidFontSize = normalizePyramidFontSize(raw.pyramidFontSize);

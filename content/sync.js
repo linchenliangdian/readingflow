@@ -170,8 +170,8 @@
           }
           const payload = pieces.join("");
           if (payload.length !== value.length || checksum(payload) !== value.hash) throw new Error("incomplete payload");
-          const state = normalizeRemote(decodePayload(payload), context.item);
-          heads.push({ id: value.revision, key: note.key, note, parts: partNotes, snapshots, envelope: value, clock, state,
+          const savedState = decodePayload(payload), state = normalizeRemote(savedState, context.item);
+          heads.push({ id: value.revision, key: note.key, note, parts: partNotes, snapshots, envelope: value, clock, state, savedState,
             hash: stateHash(state), payloadHash: value.hash, deviceID: value.deviceID, legacy: true });
         }
         catch (_) { broken.push(note.key); }
@@ -182,8 +182,11 @@
       return { heads, broken, fingerprint };
     }
     function recordFor(head, context) {
+      // A migration copies the authenticated snapshot. The current timer view
+      // must not give one legacy revision different bytes on a later pass.
+      const state = head.savedState || head.state;
       return { format: FORMAT, kind: "head", ownerKey: context.item.key, ownerKind: context.ownerKind,
-        deviceID: head.deviceID, revision: head.id, clock: clone(head.clock), state: clone(head.state), hash: head.hash };
+        deviceID: head.deviceID, revision: head.id, clock: clone(head.clock), state: clone(state), hash: stateHash(state) };
     }
     async function discover(context) {
       const legacy = await discoverLegacy(context), files = await fileStore.read(context.item.libraryID);
@@ -193,10 +196,13 @@
         if (!record || record.ownerKey !== context.item.key || record.ownerKind !== context.ownerKind) continue;
         try {
           if (!owned(record, context) || record.kind !== "head") throw new Error("invalid file record");
-          const clock = normalizeClock(record.clock), state = normalizeRemote(record.state, context.item);
-          if (!clock[record.deviceID] || stateHash(state) !== record.hash) throw new Error("invalid file state");
+          const clock = normalizeClock(record.clock);
+          // Authenticate the saved snapshot before normalization advances an
+          // expired timer or migrates an older schema-compatible field.
+          if (!clock[record.deviceID] || stateHash(record.state) !== record.hash) throw new Error("invalid file state");
+          const state = normalizeRemote(record.state, context.item);
           heads.push({ id: record.revision, key: "file:" + sourceKey + ":" + record.revision,
-            envelope: record, clock, state, hash: record.hash, payloadHash: record.hash,
+            envelope: record, clock, state, hash: stateHash(state), payloadHash: record.hash,
             deviceID: record.deviceID, legacy: false, sourceKey });
         }
         catch (_) { broken.push("file:" + sourceKey + ":" + record.revision); }
@@ -224,7 +230,7 @@
         local = core.normalizeSession(localRaw, item);
         const meta = localRaw.readingFlowSync;
         if (meta && meta.format === FORMAT && meta.ownerKey === item.key && meta.clock) {
-          try { localClock = normalizeClock(meta.clock); localDirty = meta.pending === true || meta.stateHash !== stateHash(local); }
+          try { localClock = normalizeClock(meta.clock); localDirty = meta.pending === true || meta.stateHash !== stateHash(localRaw); }
           catch (_) { legacy = true; }
         }
         else legacy = true;

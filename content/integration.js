@@ -75,9 +75,12 @@ var ReadingFlowIntegration = (function () {
     const operation = (saveQueues.get(key) || Promise.resolve()).catch(() => {}).then(work);
     saveQueues.set(key, operation); operation.catch(error => Zotero.logError(error)); return operation;
   }
-  async function writeDraft(item, state, meta) {
+  async function writeDraft(item, state, meta, { published = false } = {}) {
     const value = snapshot(state, item), path = draftPath(item);
-    if (meta) value.readingFlowSync = meta;
+    // A timer may expire while a successful file publication is awaiting I/O.
+    // Bind its clean-cache baseline to the canonical view actually persisted.
+    // Unpublished and ordinary draft writes retain the last published baseline.
+    if (meta) value.readingFlowSync = published ? { ...meta, stateHash: ReadingFlowSync.stateHash(value) } : meta;
     const content = serialized(value);
     await IOUtils.makeDirectory(dataDirectory, { ignoreExisting: true });
     await IOUtils.writeUTF8(path, content, { tmpPath: path + ".tmp" });
@@ -120,7 +123,7 @@ var ReadingFlowIntegration = (function () {
       const oldMeta = localRecords.get(sessionKey(item))?.readingFlowSync;
       await writeDraft(item, state, { ...oldMeta, pending: true });
       const result = await syncStore.save(item, state, typeof token === "function" ? token() : token, options);
-      await writeDraft(item, state, result.cacheMeta);
+      await writeDraft(item, state, result.cacheMeta, { published: true });
       return result;
     });
   }

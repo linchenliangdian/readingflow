@@ -53,6 +53,20 @@ test('rejects wrong-paper, future format, damaged timer and unbounded import dat
   assert.throws(() => core.normalizeSession(s, item, now), /过大/);
 });
 
+test('normalizing terms preserves stable identities and repairs invalid or duplicate IDs once', () => {
+  const s = core.createSession(item, now);
+  s.terms = [
+    { id: 'term-1', term: 'Nitrogen', meaning: 'N', source: 'p. 1', uncertain: true },
+    { id: 'term-1', term: 'Duplicate' }, { id: '<invalid>', term: 'Invalid' }, { term: 'Legacy' }
+  ];
+  const first = core.normalizeSession(s, item, now);
+  assert.equal(first.terms[0].id, 'term-1');
+  assert.deepEqual(first.terms[0], s.terms[0]);
+  assert.equal(new Set(first.terms.map(term => term.id)).size, 4);
+  assert.ok(first.terms.every(term => /^[A-Za-z0-9_-]{1,100}$/.test(term.id)));
+  assert.deepEqual(core.normalizeSession(first, item, now), first);
+});
+
 test('tree utilities retain sibling ordering and remove a subtree as a unit', () => {
   const s = core.createSession(item, now);
   const a = core.addNode(s, 'root');

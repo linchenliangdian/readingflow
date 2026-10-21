@@ -3,6 +3,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { device, stateFor, publish, addLegacy, core, sync, clone } = require('./file-sync-harness.cjs');
+const files = require('../content/file-sync.js');
+
+function advancingClock(t) {
+  let now = 2_000_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  return { expire() { now += core.DURATIONS.inspection + 1; } };
+}
 
 test('legacy note codec remains a bounded, lossless migration reader', t => {
   const d = device(t), state = stateFor(d, d.owner, '中文 😀 <script>alert("x")</script> & text');
@@ -74,6 +81,78 @@ test('a causal remote edit supersedes clean cache regardless of wall-clock time'
   await b.store.save(b.identity(b.owner), loaded.state, loaded.token); a.receive(b);
   first.cache.updatedAt = '2999-01-01T00:00:00.000Z'; const current = await a.store.load(a.identity(a.owner), first.cache);
   assert.equal(current.conflict, false); assert.equal(current.needsPublish, false); assert.equal(current.state.pyramid.text, 'Remote descendant');
+});
+
+test('a saved running timer opens after expiry without invalidating the snapshot or regenerating term IDs', async t => {
+  const clock = advancingClock(t), a = device(t), b = device(t, { name: 'B', libraryID: 27 }), state = stateFor(a);
+  const term = core.addTerm(state); Object.assign(term, { term: 'FACE', meaning: 'Free-air carbon dioxide enrichment', source: 'p. 1', uncertain: true });
+  core.startTimer(state, 'inspection'); await publish(a, state);
+  const attachment = a.attachments()[0], original = fs.readFileSync(attachment.filePath, 'utf8');
+  clock.expire(); b.receive(a);
+  const loaded = await b.store.load(b.identity(b.owner));
+  assert.equal(loaded.pending, false); assert.equal(loaded.conflict, false); assert.equal(loaded.needsPublish, false);
+  assert.deepEqual(loaded.state.timers.inspection, { durationMs: core.DURATIONS.inspection, remainingMs: 0, status: 'expired', deadline: null });
+  assert.deepEqual(loaded.state.terms, [term]); assert.deepEqual(loaded.state.framing, state.framing);
+  assert.equal(loaded.state.pyramid.text, state.pyramid.text); assert.equal(loaded.state.pyramid.children[0].text, 'Evidence 证据');
+  assert.equal(loaded.state.pyramidFontSize, 24); assert.deepEqual(loaded.state.pyramid.boldRanges, state.pyramid.boldRanges);
+  assert.equal(fs.readFileSync(attachment.filePath, 'utf8'), original); assert.equal(b.writes.length, 0);
+});
+
+test('timer expiry leaves the saved snapshot fingerprint stable and permits an already-open editor to save', async t => {
+  const clock = advancingClock(t), d = device(t), state = stateFor(d); core.startTimer(state, 'inspection');
+  await publish(d, state); const opened = await d.store.load(d.identity(d.owner));
+  clock.expire(); const expired = await d.store.load(d.identity(d.owner));
+  assert.equal(expired.pending, false); assert.equal(expired.token.fingerprint, opened.token.fingerprint);
+  assert.equal(expired.state.timers.inspection.status, 'expired');
+  opened.state.pyramid.text = 'Edited after the timer expired';
+  const saved = await d.store.save(d.identity(d.owner), opened.state, opened.token);
+  assert.equal(saved.token.pending, false);
+  const current = await d.store.load(d.identity(d.owner));
+  assert.equal(current.state.pyramid.text, opened.state.pyramid.text); assert.equal(current.state.timers.inspection.status, 'expired');
+  const records = (await d.fileStore.read(1)).records;
+  assert.equal(records.length, 1); assert.equal(records[0].record.hash, sync.stateHash(records[0].record.state));
+});
+
+test('a causal remote edit supersedes a clean cache whose running timer expired while closed', async t => {
+  const clock = advancingClock(t), a = device(t), b = device(t, { name: 'B' }), state = stateFor(a); core.startTimer(state, 'inspection');
+  const first = await publish(a, state); b.receive(a);
+  const remote = await b.store.load(b.identity(b.owner)); remote.state.pyramid.text = 'Causal remote edit';
+  await b.store.save(b.identity(b.owner), remote.state, remote.token); a.receive(b); clock.expire();
+  assert.equal(first.cache.timers.inspection.status, 'running');
+  const current = await a.store.load(a.identity(a.owner), first.cache);
+  assert.equal(current.pending, false); assert.equal(current.conflict, false); assert.equal(current.needsPublish, false);
+  assert.equal(current.state.pyramid.text, 'Causal remote edit'); assert.equal(current.state.timers.inspection.status, 'expired');
+  assert.equal(current.versions.some(version => version.id === 'local'), false);
+});
+
+test('a tampered raw timer remains blocked even when normalization hides the change and the journal checksum is valid', async t => {
+  advancingClock(t); const d = device(t), state = stateFor(d);
+  Object.assign(state.timers.inspection, { remainingMs: 0, status: 'expired', deadline: null });
+  const first = await publish(d, state), attachment = d.attachments()[0];
+  const journal = files.decodeJournal(fs.readFileSync(attachment.filePath, 'utf8')), record = journal.records[0];
+  Object.assign(record.state.timers.inspection, { remainingMs: core.DURATIONS.inspection, status: 'running', deadline: Date.now() - 1 });
+  assert.notEqual(sync.stateHash(record.state), record.hash);
+  assert.equal(sync.stateHash(core.normalizeSession(record.state, d.identity(d.owner))), record.hash, 'normalization alone would conceal this byte-level change');
+  const corrupted = files.encodeJournal(journal.writerID, journal.records); fs.writeFileSync(attachment.filePath, corrupted);
+  assert.equal(files.decodeJournal(corrupted).records.length, 1, 'outer journal checksum is valid');
+  await assert.rejects(() => d.store.load(d.identity(d.owner)), /尚未到齐|损坏/);
+  const safe = await d.store.load(d.identity(d.owner), first.cache); assert.equal(safe.pending, true); assert.equal(safe.state.pyramid.text, first.state.pyramid.text);
+  await assert.rejects(() => d.store.save(d.identity(d.owner), safe.state, safe.token), /尚未完整/);
+  assert.equal(fs.readFileSync(attachment.filePath, 'utf8'), corrupted);
+});
+
+test('legacy migration preserves the authenticated saved timer snapshot across expiry before upload confirmation', async t => {
+  const clock = advancingClock(t), d = device(t), state = stateFor(d); core.startTimer(state, 'inspection');
+  const old = await addLegacy(d, state); const initial = await d.store.maintenance(); assert.equal(initial.migrated, 1);
+  const attachment = d.attachments()[0], original = fs.readFileSync(attachment.filePath, 'utf8'), writes = d.writes.length;
+  const journal = files.decodeJournal(original); assert.equal(journal.records.length, 1); assert.equal(journal.records[0].state.timers.inspection.status, 'running');
+  assert.equal(journal.records[0].hash, sync.stateHash(state)); assert.equal(old.head.deleted, false);
+  clock.expire(); d.uploadAll(); const confirmed = await d.store.maintenance();
+  assert.equal(confirmed.migrated, 0); assert.equal(confirmed.archived, old.notes.length); assert.ok(old.notes.every(note => note.deleted));
+  assert.equal(d.attachments().length, 1); assert.equal(fs.readFileSync(attachment.filePath, 'utf8'), original);
+  assert.equal(d.writes.length - writes, old.notes.length, 'only the exact legacy source notes were moved to trash');
+  const loaded = await d.store.load(d.identity(d.owner)); assert.equal(loaded.pending, false); assert.equal(loaded.conflict, false);
+  assert.equal(loaded.state.timers.inspection.status, 'expired'); assert.equal(loaded.state.pyramid.text, state.pyramid.text);
 });
 
 test('a new remote record invalidates an old token instead of overwriting either device', async t => {

@@ -237,6 +237,7 @@ function harness({ scanDrafts = false, coldTools = false } = {}) {
   return { files, prefs, items, notes, transportRecords, transportWrites, get fileStore() { return currentFileStore; }, proseNotes: () => notes.filter(note => !context.ReadingFlowSync?.decodeNote(note.html)), menus, writes, pickerResponses, pickerRequests, libraries, maximumInFlight, errors, Zotero, host, parent, other, attachment, identity, draftName, originalActiveEditor, shutdownListeners, debugMessages, dbCalls, resizeObservers, observers, noteWrites, imagePosts, libraryPane, libraryNav, readerContext, nativeNoteRenderResult, core: context.ReadingFlowCore, sync: context.ReadingFlowSync, getSection: () => section,
     start: (version = '1.0.0') => context.ReadingFlowIntegration.start({ id: 'reading-flow@test', version }), stop: () => context.ReadingFlowIntegration.stop(),
     failWrite: () => { failNextWrite = true; }, failDraftWrite: (item = parent) => { failWritePath = draftName(item); }, durable: (item = parent) => JSON.parse(files.get(draftName(item))),
+    setNow(value) { context.readingFlowTestNow = value; vm.runInContext('Date.now = () => readingFlowTestNow', context); },
     restoreNote(saved) { const note = new Note('note'); Object.assign(note, { id: saved.id, key: saved.key, libraryID: saved.libraryID, parentID: saved.parentID, html: saved.html, tags: [...saved.tags], deleted: saved.deleted }); items.set(note.id, note); notes.push(note); nextID = Math.max(nextID, note.id + 1); return note; },
     async clickRail(kind = 'library') {
       const handle = Zotero.ReadingFlow.inspect(host).find(panel => panel.kind === kind), event = handle.button.click(); assert.equal(event.prevented, true); assert.equal(event.stopped, true);
@@ -912,6 +913,44 @@ test('an item notification refreshes a clean visible pyramid when a newer device
   const writes = a.noteWrites.length, refreshed = shown.config; await a.emitItemChange(ids); await new Promise(resolve => setTimeout(resolve, 320));
   assert.equal(shown.config, refreshed); assert.equal(a.noteWrites.length, writes, 'identical notifications must not create a sync write loop');
   assert.equal(a.errors.length, 0);
+});
+
+test('expiry during publication leaves a clean canonical cache that a causal remote edit can supersede', async t => {
+  const now = 2_000_000_000_000, a = harness(); a.setNow(now); await a.start(); t.after(() => a.stop());
+  const shown = await a.clickRail(), state = shown.getState(); state.pyramid.text = 'Saved before expiry'; a.core.startTimer(state, 'inspection');
+  const write = a.fileStore.write.bind(a.fileStore); let expiredDuringPublication = false;
+  a.fileStore.write = async (...args) => {
+    const result = await write(...args);
+    await Promise.resolve(); a.setNow(now + a.core.DURATIONS.inspection + 1); expiredDuringPublication = true;
+    return result;
+  };
+  await shown.config.bridge.flushState(state); assert.equal(expiredDuringPublication, true);
+  const running = [...a.transportRecords.values()].find(value => value.record.state.pyramid.text === 'Saved before expiry').record;
+  assert.equal(running.state.timers.inspection.status, 'running'); assert.equal(running.hash, a.sync.stateHash(running.state));
+  const cache = a.durable(); assert.equal(cache.timers.inspection.status, 'expired'); assert.equal(cache.readingFlowSync.pending, false);
+  assert.notEqual(a.sync.stateHash(cache), running.hash, 'expiry occurred after the published snapshot was captured');
+  assert.equal(cache.readingFlowSync.stateHash, a.sync.stateHash(cache), 'a successful publication baselines the exact canonical cache that reaches disk');
+  const b = harness(); b.setNow(now + b.core.DURATIONS.inspection + 1); transferNotes(a, b); await b.start(); t.after(() => b.stop());
+  const remote = await b.clickRail(); remote.getState().pyramid.text = 'Causal remote edit after expiry'; await remote.config.bridge.flushState(remote.getState());
+  const before = shown.config, ids = transferNotes(b, a, note => a.sync.decodeNote(note.html)?.deviceID === b.prefs.get(a.sync.DEVICE_PREF));
+  await a.emitItemChange(ids); await waitUntil(() => shown.config !== before, 'the clean expired cache should accept its causal remote descendant');
+  assert.equal(shown.config.syncPending, false); assert.equal(shown.config.syncConflict, false); assert.equal(shown.config.bridge.canEdit, true);
+  assert.equal(shown.getState().pyramid.text, 'Causal remote edit after expiry'); assert.equal(shown.getState().timers.inspection.status, 'expired');
+  assert.equal(a.errors.length, 0); assert.equal(b.errors.length, 0);
+});
+
+test('ordinary read-only draft writes retain the published baseline and preserve local edits against a remote descendant', async t => {
+  const a = harness(); await a.start(); const shown = await a.clickRail(); shown.getState().pyramid.text = 'Published baseline'; await shown.config.bridge.flushState(shown.getState());
+  const baseline = a.durable().readingFlowSync.stateHash, b = harness(); transferNotes(a, b); await b.start(); t.after(() => b.stop());
+  const remote = await b.clickRail(); remote.getState().pyramid.text = 'Remote descendant'; await remote.config.bridge.flushState(remote.getState());
+  await a.stop(); a.libraries.get(1).editable = false; await a.start(); t.after(() => a.stop()); const readOnly = await a.clickRail();
+  assert.equal(readOnly.readOnly, true); readOnly.getState().pyramid.text = 'Unpublished local reasoning'; await readOnly.config.bridge.saveDraft(readOnly.getState());
+  const draft = a.durable(); assert.equal(draft.readingFlowSync.stateHash, baseline); assert.notEqual(a.sync.stateHash(draft), baseline);
+  assert.equal(draft.readingFlowSync.pending, false, 'the raw-content comparison must still identify this ordinary dirty draft');
+  transferNotes(b, a); const loaded = await a.sync.create({ Zotero: a.Zotero, core: a.core, fileStore: a.fileStore }).load(a.identity(a.parent), draft);
+  assert.equal(loaded.pending, false); assert.equal(loaded.conflict, true); assert.equal(loaded.state.pyramid.text, 'Unpublished local reasoning');
+  assert.deepEqual(new Set(loaded.versions.map(version => version.state.pyramid.text)), new Set(['Unpublished local reasoning', 'Remote descendant']));
+  assert.equal(a.durable().pyramid.text, 'Unpublished local reasoning'); assert.equal(a.errors.length, 0);
 });
 
 test('a remote arrival preserves unsaved typing as a local conflict and explicit selection resolves it', async t => {
