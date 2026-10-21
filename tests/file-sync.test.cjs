@@ -4,6 +4,17 @@ const fs = require('node:fs');
 const { device, stateFor, recordFor, core, clone } = require('./file-sync-harness.cjs');
 const files = require('../content/file-sync.js');
 
+function removeAllTags(d) {
+  for (const item of d.items.values()) item.setTags([]);
+}
+
+async function ordinaryJSON(d, container, name = 'my-reading-data.json') {
+  const source = d.PathUtils.join(d.root, name);
+  fs.writeFileSync(source, JSON.stringify({ text: 'Personal JSON, not Reading flow sync data' }));
+  return d.Zotero.Attachments.importFromFile({ file: source, parentItemID: container.id,
+    title: 'Reading flow · 数据 · personal', contentType: 'application/json' });
+}
+
 test('journal codec preserves Unicode, formatting, owners and integrity without HTML notes', t => {
   const d = device(t), state = stateFor(d, d.owner, '中文 😀 <b>literal text</b>'), record = recordFor(d, state);
   const encoded = files.encodeJournal('writer-1', [record]), decoded = files.decodeJournal(encoded);
@@ -29,6 +40,37 @@ test('serialized writes aggregate owners while replacing only the active writer 
   await d.fileStore.write(1, [prior], { replaceOwnCurrent: false }); assert.equal((await d.fileStore.read(1)).records.length, 3);
 });
 
+test('removing every tag during an active writer lease preserves binding and all owners on the next save', async t => {
+  const d = device(t), active = d.fileStore.writerID, other = d.addOwner('PAPER002');
+  const first = recordFor(d, stateFor(d, d.owner, 'Original tagless reasoning'), { deviceID: active });
+  await d.fileStore.write(1, [first]); const file = d.attachments()[0], container = d.containers()[0];
+  removeAllTags(d);
+  const second = recordFor(d, stateFor(d, other, 'Second owner reasoning'), { owner: other, deviceID: active });
+  await d.fileStore.write(1, [second]);
+  assert.equal(d.fileStore.isManagedItem(container), true); assert.equal(d.fileStore.isManagedItem(file), true);
+  assert.equal(d.containers().length, 1); assert.equal(d.attachments().length, 1);
+  assert.equal(d.attachments()[0].key, file.key); assert.equal(d.containers()[0].key, container.key);
+  assert.deepEqual((await d.fileStore.read(1)).records.map(value => value.record), [first, second]);
+  assert.ok([...d.items.values()].every(item => item.getTags().length === 0), 'saving cannot recreate tags');
+});
+
+test('a cold device discovers tagless journals across different numeric library IDs without cache or preferences', async t => {
+  const a = device(t), b = device(t, { libraryID: 17, name: 'B' });
+  const first = recordFor(a, stateFor(a, a.owner, 'Cross-device tagless reasoning'));
+  await a.fileStore.write(1, [first]); removeAllTags(a); b.receive(a); b.prefs.clear(); b.restart();
+  assert.equal(b.containers().length, 1); assert.equal(b.attachments().length, 1);
+  assert.match(b.attachments()[0].attachmentFilename, /^file-sync-1-w-/);
+  const loaded = await b.store.load(b.identity(b.owner));
+  assert.equal(loaded.state.item.libraryID, 17); assert.equal(loaded.state.pyramid.text, first.state.pyramid.text);
+  assert.deepEqual(loaded.state.pyramid.boldRanges, first.state.pyramid.boldRanges);
+  assert.deepEqual(loaded.state.framing, first.state.framing); assert.equal(loaded.state.pyramidFontSize, 24);
+  assert.equal(b.writes.length, 0, 'read-only recovery must not create a new container or attachment');
+  loaded.state.pyramid.text = 'Edited after cold recovery';
+  await b.store.save(b.identity(b.owner), loaded.state, loaded.token);
+  assert.equal(b.containers().length, 1); assert.equal(b.attachments().length, 2, 'a new activation writes its own file under the existing container');
+  assert.ok([...b.items.values()].every(item => item.getTags().length === 0), 'cold save cannot recreate tags');
+});
+
 test('separate writers never edit each other files, even with cloned stable device preferences', async t => {
   const a = device(t), b = device(t, { name: 'B' }); b.prefs.set('readingFlow.syncDeviceID', 'device-A');
   assert.notEqual(a.fileStore.writerID, b.fileStore.writerID);
@@ -44,7 +86,7 @@ test('offline duplicate containers are read together and no device data disappea
   const a = device(t), b = device(t, { name: 'B' });
   await a.fileStore.write(1, [recordFor(a, stateFor(a, a.owner, 'Offline A'))]);
   await b.fileStore.write(1, [recordFor(b, stateFor(b, b.owner, 'Offline B'), { deviceID: 'device-B' })]);
-  assert.notEqual(a.containers()[0].key, b.containers()[0].key); a.receive(b); b.receive(a);
+  assert.notEqual(a.containers()[0].key, b.containers()[0].key); removeAllTags(a); removeAllTags(b); a.receive(b); b.receive(a);
   assert.equal(a.containers().length, 2); assert.equal(b.containers().length, 2);
   assert.deepEqual(new Set((await a.fileStore.read(1)).records.map(value => value.record.state.pyramid.text)), new Set(['Offline A', 'Offline B']));
   assert.equal((await b.fileStore.read(1)).records.length, 2);
@@ -53,6 +95,7 @@ test('offline duplicate containers are read together and no device data disappea
   assert.ok(a.attachments().every(item => item.parentID === a.containers()[0].id && !item.deleted));
   for (const item of a.attachments()) assert.equal(fs.readFileSync(item.filePath, 'utf8'), bytes.get(item.key));
   assert.equal((await a.fileStore.read(1)).records.length, 2); assert.equal(await a.fileStore.consolidate(1), 0);
+  assert.ok([...a.items.values()].every(item => item.getTags().length === 0));
 });
 
 test('duplicate consolidation preserves user-added notes and unrelated attachments', async t => {
@@ -60,8 +103,10 @@ test('duplicate consolidation preserves user-added notes and unrelated attachmen
   const duplicate = a.containers().sort((left, right) => left.key.localeCompare(right.key))[1];
   const prose = new a.Zotero.Item('note'); prose.parentID = duplicate.id; prose.setNote('<p>User added prose</p>'); await prose.save();
   const unrelated = new a.Zotero.Item('attachment'); unrelated.parentID = duplicate.id; unrelated.attachmentLinkMode = 0; await unrelated.save();
+  const personalJSON = await ordinaryJSON(a, duplicate); removeAllTags(a);
   a.failTrash(); await a.fileStore.consolidate(1); a.failTrash(false);
   assert.equal(duplicate.deleted, false); assert.equal(prose.deleted, false); assert.equal(prose.parentID, duplicate.id); assert.equal(unrelated.parentID, duplicate.id);
+  assert.equal(personalJSON.parentID, duplicate.id); assert.equal(personalJSON.deleted, false);
   assert.equal((await a.fileStore.read(1)).records.length, 2);
 });
 
@@ -75,7 +120,7 @@ test('a failed duplicate cleanup rolls back reparenting and preserves every stor
 });
 
 test('missing, corrupt, and awaiting-download files stay pending with a stable fingerprint', async t => {
-  const a = device(t), b = device(t, { name: 'B' }); await a.fileStore.write(1, [recordFor(a)]); b.receive(a, { files: false });
+  const a = device(t), b = device(t, { name: 'B' }); await a.fileStore.write(1, [recordFor(a)]); removeAllTags(a); b.receive(a, { files: false });
   const missing = await b.fileStore.read(1); assert.equal(missing.records.length, 0); assert.equal(missing.pending.length, 1); assert.match(missing.fingerprint, /pending/);
   b.receive(a); const item = b.attachments()[0], text = fs.readFileSync(item.filePath, 'utf8'); fs.writeFileSync(item.filePath, 'bad JSON');
   const corrupt = await b.fileStore.read(1); assert.equal(corrupt.records.length, 0); assert.equal(corrupt.pending.length, 1);
@@ -86,12 +131,30 @@ test('missing, corrupt, and awaiting-download files stay pending with a stable f
 
 test('ordinary same-title items and unrelated attachments are never treated as managed data', async t => {
   const d = device(t), ordinary = new d.Zotero.Item('document'); ordinary.setField('title', 'Reading flow 数据'); ordinary.setField('extra', 'User prose'); await ordinary.save();
-  const spoof = new d.Zotero.Item('document'); spoof.setField('extra', files.CONTAINER_MARKER); await spoof.save();
-  assert.equal(d.fileStore.isManagedItem(ordinary), false); assert.equal(d.fileStore.isManagedItem(spoof), false);
+  const spoof = new d.Zotero.Item('document'); spoof.setField('extra', 'User text: ' + files.CONTAINER_MARKER); await spoof.save();
+  const wrongType = new d.Zotero.Item('journalArticle'); wrongType.setField('extra', files.CONTAINER_MARKER); await wrongType.save();
+  assert.equal(d.fileStore.isManagedItem(ordinary), false); assert.equal(d.fileStore.isManagedItem(spoof), false); assert.equal(d.fileStore.isManagedItem(wrongType), false);
   const record = recordFor(d); await d.fileStore.write(1, [record]); const container = d.containers()[0];
   const unrelated = new d.Zotero.Item('attachment'); unrelated.parentID = container.id; unrelated.attachmentLinkMode = 0; await unrelated.save();
+  const personalJSON = await ordinaryJSON(d, container); const personalBytes = fs.readFileSync(personalJSON.filePath, 'utf8');
   assert.equal(d.fileStore.isManagedItem(unrelated), false); assert.equal((await d.fileStore.read(1)).pending.length, 0);
-  assert.equal(d.fileStore.isManagedItem(container), true); assert.equal(d.fileStore.isManagedItem(d.attachments().find(item => item !== unrelated)), true);
+  assert.equal(d.fileStore.isManagedItem(personalJSON), false); assert.equal(fs.readFileSync(personalJSON.filePath, 'utf8'), personalBytes);
+  assert.equal(d.fileStore.isManagedItem(container), true); assert.equal(d.fileStore.isManagedItem(d.attachments().find(item => item !== unrelated && item !== personalJSON)), true);
+  fs.writeFileSync(personalJSON.filePath, 'Unrelated malformed JSON');
+  assert.equal((await d.fileStore.read(1)).pending.length, 0, 'an unrelated malformed JSON must not block Reading flow');
+  fs.unlinkSync(personalJSON.filePath);
+  assert.equal((await d.fileStore.read(1)).pending.length, 0, 'an unrelated missing JSON must not block Reading flow');
+});
+
+test('removing a reserved marker or moving an active file to an ordinary item still refuses unsafe writes', async t => {
+  const d = device(t), first = recordFor(d); await d.fileStore.write(1, [first]);
+  const item = d.attachments()[0], container = d.containers()[0], before = fs.readFileSync(item.filePath, 'utf8');
+  container.setField('extra', 'User prose instead of a reserved data marker');
+  await assert.rejects(d.fileStore.write(1, [recordFor(d)]), /关联已改变/);
+  assert.equal(fs.readFileSync(item.filePath, 'utf8'), before);
+  container.setField('extra', files.CONTAINER_MARKER); item.parentID = d.owner.id;
+  await assert.rejects(d.fileStore.write(1, [recordFor(d)]), /关联已改变/);
+  assert.equal(fs.readFileSync(item.filePath, 'utf8'), before);
 });
 
 test('only exact bytes confirmed by Zotero file sync authorize uploaded records', async t => {

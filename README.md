@@ -1,4 +1,4 @@
-# Reading flow 2.2.2
+# Reading flow 2.2.3
 
 A tool for better reading and note-taking
 
@@ -6,11 +6,11 @@ A tool for better reading and note-taking
 
 ## 安装与打开
 
-1. 从 [GitHub Releases](https://github.com/linchenliangdian/readingflow/releases/latest) 下载 `reading-flow-2.2.2.xpi`。Zotero → **工具 → 插件** → 齿轮 → **从文件安装插件**，选择下载的 XPI。同一插件 ID 会替换旧版。安装后重启 Zotero，再打开阅读台。
+1. 从 [GitHub Releases](https://github.com/linchenliangdian/readingflow/releases/latest) 下载 `reading-flow-2.2.3.xpi`。Zotero → **工具 → 插件** → 齿轮 → **从文件安装插件**，选择下载的 XPI。同一插件 ID 会替换旧版。安装后重启 Zotero，再打开阅读台。
 2. 在文献库中选中文献或独立笔记，也可在 Zotero 标签页打开文献的 PDF。在右侧竖排图标中点击小金字塔 **阅读台**；也可右键选中的条目 → 阅读台。
 3. 在侧栏直接写笔记。点击其他侧栏图标，可以回到 Zotero 信息、笔记或 Better Notes 面板。
 
-**已有 2.1.0 或更早版本的设备，需要手动安装一次 2.2.2。** 从这一版起，插件通过本仓库的 GitHub Releases 提供更新，后续更新跟随 Zotero 插件管理器中的自动更新设置；关闭自动更新时，可在插件管理器中手动检查更新。各设备需分别安装插件，Zotero 的文献数据同步不会安装插件。
+**已有 2.1.0 或更早版本的设备，需要手动安装一次 2.2.3。** 从这一版起，插件通过本仓库的 GitHub Releases 提供更新，后续更新跟随 Zotero 插件管理器中的自动更新设置；关闭自动更新时，可在插件管理器中手动检查更新。各设备需分别安装插件，Zotero 的文献数据同步不会安装插件。
 
 首次为文献打开阅读台，会在文献下创建一篇普通子笔记，不自动添加标签。以后通过笔记的固定 Key 继续使用同一篇笔记，正文由 Zotero 自动保存，可以使用原有的加粗、标题、列表、引用及注释操作。提纲可以自由修改或删除。打开旧版阅读笔记时，会在确认并保存关联后移除旧版自动添加的 `Reading Flow` 和 `Reading Flow · sidebar` 标签，保留你自己的其他标签；独立笔记的标签不作修改。
 
@@ -50,11 +50,13 @@ A tool for better reading and note-taking
 
 每个文献库使用专用数据条目集中收纳。条目下可能有多个 JSON 文件：每次插件启动使用独立写入文件，保留其他设备或历史启动创建的文件，避免离线修改或复制配置后互相覆盖。请保留由插件管理的数据条目及附件；它们共同保存可编辑金字塔和冲突版本。
 
-**可编辑金字塔和正文 PNG 都需要 Zotero 文件同步。** JSON 使用 Zotero 存储附件，可通过 Zotero Storage 或适用的 WebDAV 文件同步传输；仅完成条目数据同步不足以下载文件。各设备需升级到 2.2.2 或更高版本，使用同一账户同步同一个文献库。保留“按需下载”设置也可以，打开金字塔时插件会请求下载缺失的数据附件，不会改变 PDF 下载偏好。参见 [Zotero 文件同步设置](https://www.zotero.org/support/preferences/sync)。
+**2.2.3 修复了删除内部标签后无法打开金字塔的问题。** 数据识别改用专用条目的固定标记、存储附件信息和 JSON 内容校验，不再依赖标签，也不再给数据条目或附件自动添加标签。旧版已去掉标签的数据文件可以继续读取；各设备都应升级到 2.2.3 或更高版本。
+
+**可编辑金字塔和正文 PNG 都需要 Zotero 文件同步。** JSON 使用 Zotero 存储附件，可通过 Zotero Storage 或适用的 WebDAV 文件同步传输；仅完成条目数据同步不足以下载文件。各设备需升级到 2.2.3 或更高版本，使用同一账户同步同一个文献库。保留“按需下载”设置也可以，打开金字塔时插件会请求下载缺失的数据附件，不会改变 PDF 下载偏好。参见 [Zotero 文件同步设置](https://www.zotero.org/support/preferences/sync)。
 
 旧版迁移按以下顺序进行：
 
-1. **先在保有旧金字塔的电脑上安装并运行 2.2.2**。插件读取旧数据笔记及本机旧 JSON，将完整、可验证的版本写入专用条目下的数据文件。
+1. **先在保有旧金字塔的电脑上安装并运行 2.2.3**。插件读取旧数据笔记及本机旧 JSON，将完整、可验证的版本写入专用条目下的数据文件。
 2. 完成 Zotero 数据和文件同步。插件核实对应 JSON 的实际内容与已上传校验值一致后，才将已经完整迁移的旧数据笔记移入 Zotero 回收站；不会永久删除。
 3. 在其他桌面设备上安装新版，同步同一文献库并下载数据附件，再打开阅读台。正文笔记及图片继续按 Zotero 原有方式使用。
 
@@ -92,14 +94,14 @@ python build.py
 ## 发布新版本
 
 1. 同时提升 `manifest.json` 与 `package.json` 的版本号，并把 `content/app.xhtml` 中样式与脚本 URL 的 `?v=` 更新为相同版本；构建会校验这三个资源的版本，避免更新后复用旧缓存。使用递增的 `X.Y.Z` 稳定版本，保持插件 ID `reading-flow@local` 不变。
-2. 运行测试与构建，提交源码，再创建并推送对应标签 `vX.Y.Z`。例如版本 `2.2.2` 对应标签 `v2.2.2`。
+2. 运行测试与构建，提交源码，再创建并推送对应标签 `vX.Y.Z`。例如版本 `2.2.3` 对应标签 `v2.2.3`。
 3. 标签触发 GitHub Actions 工作流。工作流校验版本与标签、运行测试、构建 XPI、生成带 SHA-256 的更新清单，然后发布 GitHub Release 的 XPI、`updates.json` 与校验文件。
 
 本地可先生成发布文件而不上传：
 
 ```sh
 python build.py
-python scripts/release.py --repository linchenliangdian/readingflow --tag v2.2.2 --xpi output/reading-flow-2.2.2.xpi
+python scripts/release.py --repository linchenliangdian/readingflow --tag v2.2.3 --xpi output/reading-flow-2.2.3.xpi
 ```
 
 同一版本的已发布安装包不应覆盖；修复后提升版本并创建新标签。仓库需公开，以便 Zotero 无需 GitHub 登录即可读取更新清单和安装包。

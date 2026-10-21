@@ -84,27 +84,31 @@
       current.finally(() => { if (queues.get(libraryID) === current) queues.delete(libraryID); }).catch(() => {});
       return current;
     }
-    function hasTag(item, tag) {
-      return typeof item.hasTag === "function" ? item.hasTag(tag) :
-        typeof item.getTags === "function" && item.getTags().some(value => value.tag === tag);
-    }
     function isContainer(item) {
       return !!(item && !item.deleted && typeof item.isRegularItem === "function" && item.isRegularItem() &&
-        typeof item.getField === "function" && String(item.getField("extra") || "").split(/\r?\n/).includes(CONTAINER_MARKER) && hasTag(item, CONTAINER_TAG));
+        item.itemType === "document" && typeof item.getField === "function" &&
+        String(item.getField("extra") || "").split(/\r?\n/).includes(CONTAINER_MARKER));
+    }
+    function isDataAttachment(item) {
+      return !!(item && !item.deleted && typeof item.isStoredFileAttachment === "function" &&
+        item.isStoredFileAttachment() && item.parentID &&
+        /^application\/json(?:;|$)/i.test(item.attachmentContentType || "") &&
+        /^file-sync-\d+-[A-Za-z0-9_-]{1,100}\.json$/.test(item.attachmentFilename || ""));
     }
     function isManagedItem(item) {
       if (isContainer(item)) return true;
-      if (!item || item.deleted || typeof item.isStoredFileAttachment !== "function" ||
-          !item.isStoredFileAttachment() || !hasTag(item, FILE_TAG) || !item.parentID) return false;
-      return isContainer(Zotero.Items.get(item.parentID));
+      return isDataAttachment(item) && isContainer(Zotero.Items.get(item.parentID));
     }
     async function containers(libraryID) {
       const search = new Zotero.Search(); search.libraryID = libraryID;
       search.addCondition("itemType", "is", "document"); search.addCondition("deleted", "false");
-      search.addCondition("tag", "is", CONTAINER_TAG);
+      search.addCondition("extra", "contains", CONTAINER_MARKER);
       const values = [];
       for (const id of await search.search()) {
         const item = await Zotero.Items.getAsync(id);
+        if (item && typeof item.loadDataType === "function") {
+          await item.loadDataType("itemData"); await item.loadDataType("childItems");
+        }
         if (item && item.libraryID === libraryID && isContainer(item)) values.push(item);
       }
       return values.sort((a, b) => a.key.localeCompare(b.key));
@@ -116,8 +120,7 @@
           if (seen.has(id)) continue; seen.add(id);
           const item = await Zotero.Items.getAsync(id);
           if (item && item.libraryID === libraryID && item.parentID === container.id &&
-              !item.deleted && typeof item.isStoredFileAttachment === "function" &&
-              item.isStoredFileAttachment() && hasTag(item, FILE_TAG)) values.push(item);
+              isDataAttachment(item)) values.push(item);
         }
       }
       return values;
@@ -164,7 +167,7 @@
       const found = await containers(libraryID);
       if (found.length) return found[0];
       const item = new Zotero.Item("document"); item.libraryID = libraryID;
-      item.setField("title", "Reading flow 数据"); item.setField("extra", CONTAINER_MARKER); item.addTag(CONTAINER_TAG);
+      item.setField("title", "Reading flow 数据"); item.setField("extra", CONTAINER_MARKER);
       await item.saveTx(); return item;
     }
     async function consolidate(libraryID) {
@@ -176,6 +179,7 @@
           if (!canonical || canonical.deleted) return 0;
           let moved = 0;
           for (const duplicate of found.slice(1)) {
+            if (typeof duplicate.loadDataType === "function") await duplicate.loadDataType("tags");
             const attachments = await Zotero.Items.getAsync(duplicate.getAttachments());
             const managed = attachments.filter(item => item && item.libraryID === libraryID &&
               item.parentID === duplicate.id && isManagedItem(item));
@@ -235,7 +239,7 @@
           try {
             item = await Zotero.Attachments.importFromFile({ file: temporary, parentItemID: container.id,
               title: "Reading flow · 数据 · " + writerID.slice(0, 14), contentType: "application/json" });
-            item.addTag(FILE_TAG); item.attachmentSyncState = "to_upload"; await item.saveTx();
+            item.attachmentSyncState = "to_upload"; await item.saveTx();
             ownFiles.set(libraryID, item);
           }
           finally {

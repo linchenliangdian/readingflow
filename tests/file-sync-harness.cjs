@@ -23,6 +23,7 @@ function device(t, { libraryID = 1, name = 'A' } = {}) {
     isRegularItem() { return !this.isNote() && !this.isAttachment(); }
     isFileAttachment() { return this.isAttachment(); }
     isStoredFileAttachment() { return this.isAttachment() && this.attachmentLinkMode === 0; }
+    get attachmentFilename() { return this.isAttachment() && this.filePath ? path.basename(this.filePath) : ''; }
     setNote(html) { this.html = html; } getNote() { return this.html || ''; }
     setField(field, value) { this.fields[field] = value; } getField(field) { return this.fields[field] || ''; }
     addTag(tag) { if (!this.tags.includes(tag)) this.tags.push(tag); }
@@ -115,7 +116,7 @@ function device(t, { libraryID = 1, name = 'A' } = {}) {
   const legacyNotes = () => [...items.values()].filter(item => item.isNote() && sync.decodeNote(item.getNote()));
   const nativeNotes = () => [...items.values()].filter(item => item.isNote() && !item.deleted);
   const attachments = () => [...items.values()].filter(item => item.isAttachment() && !item.deleted);
-  const containers = () => [...items.values()].filter(item => item.isRegularItem() && item.getField('extra').split(/\r?\n/).includes('READING_FLOW_DATA_CONTAINER_V2') && item.tags.includes('Reading flow · data') && !item.deleted);
+  const containers = () => [...items.values()].filter(item => item.itemType === 'document' && item.getField('extra').split(/\r?\n/).includes('READING_FLOW_DATA_CONTAINER_V2') && !item.deleted);
   const d = { Zotero, IOUtils, PathUtils, root, items, prefs, writes, transactions, trashCalls, library, owner, addOwner, identity, legacyNotes, nativeNotes, attachments, containers, md5,
     failSaveAfter(count) { failAt = writeCount + count; },
     failFileWriteAfter(count) { failFileAt = fileWrites + count; },
