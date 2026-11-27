@@ -412,6 +412,7 @@
     html += '<p><strong>我的判断：</strong>同意／不同意／暂不判断</p>';
     html += '<p><strong>理由与证据：</strong>信息不足 · 事实错误 · 推理问题 · 分析未尽</p>';
     html += '<p><strong>对我有何意义：</strong></p>';
+    html += '<p><strong>阅读时间：</strong></p>';
     if (s.reflection.unresolved) html += line('尚未理解／待验证', s.reflection.unresolved);
     if (s.reflection.nextStep) html += line('下一步', s.reflection.nextStep);
     const checked = [
